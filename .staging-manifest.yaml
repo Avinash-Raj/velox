@@ -1,0 +1,66 @@
+# Staging Branch Manifest
+# This file describes how this staging branch was created
+
+metadata:
+  generated_at: "2026-01-23T17:43:59Z"
+  target_repository: "Avinash-Raj/velox"
+  target_branch: "staging"
+  dated_branch: "staging_01-23-2026"
+
+base:
+  repository: "facebookincubator/velox"
+  branch: "main"
+  commit: "0cd99c637cfcd181c08cffa96e51ac32b841372d"
+  url: "https://github.com/facebookincubator/velox/tree/0cd99c637cfcd181c08cffa96e51ac32b841372d"
+
+merged_prs:
+  - number: 16104
+    commit: "3e409ab8ca59a8a7274077257cf572b64d3916b2"
+    author: "jinchengchenghh"
+    title: "fix(cudf): Fix companion function kind added result type"
+    url: "https://github.com/facebookincubator/velox/pull/16104"
+  - number: 16070
+    commit: "83af63151dd2e834f159a1d7a68343147a3caf94"
+    author: "shrshi"
+    title: "feat(cuDF): Use cuDF index filtering API for filtered joins"
+    url: "https://github.com/facebookincubator/velox/pull/16070"
+  - number: 16056
+    commit: "450e59d51bb19f92b73a847659e46027a9d57a05"
+    author: "jinchengchenghh"
+    title: "fix(cudf): Fix cudf validate expression memory pool"
+    url: "https://github.com/facebookincubator/velox/pull/16056"
+  - number: 16037
+    commit: "74416393f34a2fd3a1b4805704e9c0dbcbd8c30d"
+    author: "dan13bauer"
+    title: "feat(Cudf): Upgrade cudf-exchange to version 2026-01-09"
+    url: "https://github.com/facebookincubator/velox/pull/16037"
+  - number: 15831
+    commit: "8fa31ba4d167cc6c1db72761ec6a05ff4db7564c"
+    author: "karthikeyann"
+    title: "refactor(cudf): Improve debug printing for cudf "
+    url: "https://github.com/facebookincubator/velox/pull/15831"
+  - number: 15700
+    commit: "2ff72ab2a80b0a48f4b742c3da71d3595cdb1627"
+    author: "majetideepak"
+    title: "feat(cudf): Run tests in CI"
+    url: "https://github.com/facebookincubator/velox/pull/15700"
+  - number: 15529
+    commit: "38358b21e2698c89b3d531cb387ae82065ba2158"
+    author: "mattgara"
+    title: "feat(cudf): Check signatures of aggregate functions before replacing with `cudf` variants"
+    url: "https://github.com/facebookincubator/velox/pull/15529"
+  - number: 15498
+    commit: "b8ef45a3800832bba41c7f3cbab506a292d606c1"
+    author: "zoltan"
+    title: "feat(cudf): Implement and default to automatic GPU detection"
+    url: "https://github.com/facebookincubator/velox/pull/15498"
+  - number: 15404
+    commit: "9ebda67da66ede0944d410fd8505e9ddbbdf76b5"
+    author: "zoltan"
+    title: "feat: PartitionedOutputNode must distinguish the root of a plan"
+    url: "https://github.com/facebookincubator/velox/pull/15404"
+  - number: 14968
+    commit: "683cfc1789978b7d91b78683629224b500d67be6"
+    author: "mhaseeb123"
+    title: "feat(cudf): Add `start`, `length` and `infoColumns` fields to `CudfHiveConnectorSplit`"
+    url: "https://github.com/facebookincubator/velox/pull/14968"
