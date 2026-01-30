@@ -170,7 +170,9 @@ bool CompileState::compile(bool allowCpuFallback) {
       return false;
     }
 
-    return true;
+    // Use aggregation-based canBeEvaluatedByCudf
+    return canBeEvaluatedByCudf(
+        *aggregationPlanNode, ctx->task->queryCtx().get());
   };
 
   auto isJoinSupported = [getPlanNode](const exec::Operator* op) {
@@ -484,7 +486,9 @@ void registerCudf() {
     return;
   }
 
-  registerBuiltinFunctions(CudfConfig::getInstance().functionNamePrefix);
+  auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  registerBuiltinFunctions(prefix);
+  registerStepAwareBuiltinAggregationFunctions(prefix);
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
