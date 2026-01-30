@@ -1,0 +1,51 @@
+# Staging Branch Manifest
+# This file describes how this staging branch was created
+
+metadata:
+  generated_at: "2026-01-30T11:14:45Z"
+  target_repository: "Avinash-Raj/velox"
+  target_branch: "staging"
+  dated_branch: "staging_01-30-2026"
+
+base:
+  repository: "facebookincubator/velox"
+  branch: "main"
+  commit: "c643a78b6c94e1a6a6bf30a37bb1ffb81641f4a4"
+  url: "https://github.com/facebookincubator/velox/tree/c643a78b6c94e1a6a6bf30a37bb1ffb81641f4a4"
+
+merged_prs:
+  - number: 16075
+    commit: "unknown"
+    author: "lamarrr"
+    title: "feat(cudf): Implement JIT Expression Evaluator for CUDF"
+    url: "https://github.com/facebookincubator/velox/pull/16075"
+  - number: 16050
+    commit: "unknown"
+    author: "PointKernel"
+    title: "feat(cudf): Add `approx_distinct` global aggregation support"
+    url: "https://github.com/facebookincubator/velox/pull/16050"
+  - number: 16037
+    commit: "unknown"
+    author: "dan13bauer"
+    title: "feat(Cudf): Upgrade cudf-exchange to version 2026-01-09"
+    url: "https://github.com/facebookincubator/velox/pull/16037"
+  - number: 15700
+    commit: "unknown"
+    author: "majetideepak"
+    title: "feat(cudf): Run tests in CI"
+    url: "https://github.com/facebookincubator/velox/pull/15700"
+  - number: 15529
+    commit: "unknown"
+    author: "mattgara"
+    title: "feat(cudf): Check signatures of aggregate functions before replacing with `cudf` variants"
+    url: "https://github.com/facebookincubator/velox/pull/15529"
+  - number: 15404
+    commit: "unknown"
+    author: "zoltan"
+    title: "feat: PartitionedOutputNode must distinguish the root of a plan"
+    url: "https://github.com/facebookincubator/velox/pull/15404"
+  - number: 14968
+    commit: "unknown"
+    author: "mhaseeb123"
+    title: "feat(cudf): Add `start`, `length` and `infoColumns` fields to `CudfHiveConnectorSplit`"
+    url: "https://github.com/facebookincubator/velox/pull/14968"
