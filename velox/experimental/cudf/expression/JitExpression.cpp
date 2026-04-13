@@ -13,9 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
-#include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/expression/AstPrinter.h"
+#include "velox/experimental/cudf/expression/JitExpression.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -63,6 +64,36 @@ ColumnOrView JitExpression::eval(
     allColumnViews.push_back(asView(precomputedCol));
   }
 
+  // When the result requires DECIMAL128, upcast any DECIMAL64 input columns
+  // before evaluation to prevent intermediate overflow (e.g. MUL of two
+  // short decimals whose product exceeds 64-bit range).  We can only do
+  // this when the AST tree contains no DECIMAL64 scalar literals, because
+  // those are embedded in the tree and cannot be upcast — mixing DECIMAL128
+  // columns with DECIMAL64 scalars would cause a JIT compilation error.
+  std::vector<std::unique_ptr<cudf::column>> upcastColumns;
+  if (finalize) {
+    const auto requestedType =
+        cudf_velox::veloxToCudfDataType(expr_.expr_->type());
+    if (requestedType.id() == cudf::type_id::DECIMAL128) {
+      bool hasDecimal64Scalars = std::any_of(
+          expr_.scalars_.begin(),
+          expr_.scalars_.end(),
+          [](const auto& s) {
+            return s && s->type().id() == cudf::type_id::DECIMAL64;
+          });
+      if (!hasDecimal64Scalars) {
+        for (auto& view : allColumnViews) {
+          if (view.type().id() == cudf::type_id::DECIMAL64) {
+            auto castType = cudf::data_type{
+                cudf::type_id::DECIMAL128, view.type().scale()};
+            upcastColumns.push_back(cudf::cast(view, castType, stream, mr));
+            view = upcastColumns.back()->view();
+          }
+        }
+      }
+    }
+  }
+
   cudf::table_view astInputTableView(allColumnViews);
 
   auto result = [&]() -> ColumnOrView {
@@ -72,13 +103,14 @@ ColumnOrView JitExpression::eval(
       if (columnIndex < inputColumnViews.size()) {
         return inputColumnViews[columnIndex];
       } else {
-        // Referencing a precomputed column return as it is (view or owned)
         return std::move(
             precomputedColumns[columnIndex - inputColumnViews.size()]);
       }
     } else {
-      std::cout << cudf::ast::expression_to_string(expr_.cudfTree_.back(), astInputTableView)
-                << std::endl;
+      if (CudfConfig::getInstance().debugEnabled) {
+        LOG(INFO) << cudf::ast::expression_to_string(
+            expr_.cudfTree_.back(), astInputTableView);
+      }
       return cudf::compute_column_jit(
           astInputTableView, expr_.cudfTree_.back(), stream, mr);
     }

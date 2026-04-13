@@ -91,6 +91,35 @@ ColumnOrView ASTExpression::eval(
     allColumnViews.push_back(asView(precomputedCol));
   }
 
+  // When the result requires DECIMAL128, upcast any DECIMAL64 input columns
+  // before evaluation to prevent intermediate overflow (e.g. MUL of two
+  // short decimals whose product exceeds 64-bit range).  We can only do
+  // this when the AST tree contains no DECIMAL64 scalar literals, because
+  // those are embedded in the tree and cannot be upcast — mixing DECIMAL128
+  // columns with DECIMAL64 scalars would cause a type mismatch error.
+  std::vector<std::unique_ptr<cudf::column>> upcastColumns;
+  if (finalize) {
+    const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
+    if (requestedType.id() == cudf::type_id::DECIMAL128) {
+      bool hasDecimal64Scalars = std::any_of(
+          scalars_.begin(),
+          scalars_.end(),
+          [](const auto& s) {
+            return s && s->type().id() == cudf::type_id::DECIMAL64;
+          });
+      if (!hasDecimal64Scalars) {
+        for (auto& view : allColumnViews) {
+          if (view.type().id() == cudf::type_id::DECIMAL64) {
+            auto castType = cudf::data_type{
+                cudf::type_id::DECIMAL128, view.type().scale()};
+            upcastColumns.push_back(cudf::cast(view, castType, stream, mr));
+            view = upcastColumns.back()->view();
+          }
+        }
+      }
+    }
+  }
+
   cudf::table_view astInputTableView(allColumnViews);
 
   auto result = [&]() -> ColumnOrView {
@@ -100,7 +129,6 @@ ColumnOrView ASTExpression::eval(
       if (columnIndex < inputColumnViews.size()) {
         return inputColumnViews[columnIndex];
       } else {
-        // Referencing a precomputed column return as it is (view or owned)
         return std::move(
             precomputedColumns[columnIndex - inputColumnViews.size()]);
       }
