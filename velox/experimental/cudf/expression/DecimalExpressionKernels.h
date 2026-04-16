@@ -47,4 +47,13 @@ std::unique_ptr<cudf::column> decimalDivide(
     int32_t aRescale,
     rmm::cuda_stream_view stream);
 
+/// Rounds a decimal column from a higher-precision scale to a lower scale
+/// using round-half-away-from-zero: if (val >= 0) (val + half) / factor
+///                                  else          (val - half) / factor
+/// where factor = 10^(inputScale - outputScale), half = factor / 2.
+std::unique_ptr<cudf::column> decimalRoundCast(
+    const cudf::column_view& input,
+    cudf::data_type outputType,
+    rmm::cuda_stream_view stream);
+
 } // namespace facebook::velox::cudf_velox

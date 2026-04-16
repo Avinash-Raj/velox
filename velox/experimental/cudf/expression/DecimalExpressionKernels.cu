@@ -300,4 +300,76 @@ std::unique_ptr<cudf::column> decimalDivide(
   return out;
 }
 
+template <typename InT, typename OutT>
+__global__ void decimalRoundCastKernel(
+    const InT* input,
+    OutT* output,
+    int32_t numRows,
+    __int128_t factor,
+    __int128_t half) {
+  int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numRows) {
+    return;
+  }
+  __int128_t val = input[idx];
+  if (val >= 0) {
+    output[idx] = static_cast<OutT>((val + half) / factor);
+  } else {
+    output[idx] = static_cast<OutT>((val - half) / factor);
+  }
+}
+
+template <typename InT, typename OutT>
+void launchRoundCastKernel(
+    const cudf::column_view& input,
+    cudf::mutable_column_view output,
+    __int128_t factor,
+    __int128_t half,
+    rmm::cuda_stream_view stream) {
+  if (input.size() == 0) {
+    return;
+  }
+  int32_t blockSize = 256;
+  int32_t gridSize = (input.size() + blockSize - 1) / blockSize;
+  decimalRoundCastKernel<<<gridSize, blockSize, 0, stream.value()>>>(
+      input.data<InT>(), output.data<OutT>(), input.size(), factor, half);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+std::unique_ptr<cudf::column> decimalRoundCast(
+    const cudf::column_view& input,
+    cudf::data_type outputType,
+    rmm::cuda_stream_view stream) {
+  int32_t scaleReduction = outputType.scale() - input.type().scale();
+  CUDF_EXPECTS(scaleReduction > 0, "decimalRoundCast requires scale reduction");
+
+  auto factor = pow10Int128(scaleReduction);
+  auto half = factor / 2;
+
+  auto nullMask = cudf::copy_bitmask(input, stream);
+  auto nullCount = input.null_count();
+  auto out = cudf::make_fixed_width_column(
+      outputType, input.size(), std::move(nullMask), nullCount, stream);
+
+  if (input.type().id() == cudf::type_id::DECIMAL64) {
+    if (outputType.id() == cudf::type_id::DECIMAL64) {
+      launchRoundCastKernel<int64_t, int64_t>(
+          input, out->mutable_view(), factor, half, stream);
+    } else {
+      launchRoundCastKernel<int64_t, __int128_t>(
+          input, out->mutable_view(), factor, half, stream);
+    }
+  } else {
+    if (outputType.id() == cudf::type_id::DECIMAL64) {
+      launchRoundCastKernel<__int128_t, int64_t>(
+          input, out->mutable_view(), factor, half, stream);
+    } else {
+      launchRoundCastKernel<__int128_t, __int128_t>(
+          input, out->mutable_view(), factor, half, stream);
+    }
+  }
+
+  return out;
+}
+
 } // namespace facebook::velox::cudf_velox

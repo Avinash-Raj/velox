@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/expression/AstPrinter.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
+#include "velox/experimental/cudf/expression/DecimalExpressionKernels.h"
 #include "velox/experimental/cudf/vector/TableViewPrinter.h"
 
 #include "velox/expression/ConstantExpr.h"
@@ -145,7 +146,13 @@ ColumnOrView ASTExpression::eval(
     const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
     auto resultView = asView(result);
     if (resultView.type() != requestedType) {
-      result = cudf::cast(resultView, requestedType, stream, mr);
+      if (cudf::is_fixed_point(resultView.type()) &&
+          cudf::is_fixed_point(requestedType) &&
+          resultView.type().scale() < requestedType.scale()) {
+        result = decimalRoundCast(resultView, requestedType, stream);
+      } else {
+        result = cudf::cast(resultView, requestedType, stream, mr);
+      }
     }
   }
   return result;

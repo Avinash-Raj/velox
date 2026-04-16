@@ -24,6 +24,7 @@
 // TODO(kn): in another PR
 // #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/expression/DecimalTypeCheck.h"
+#include "velox/type/DecimalUtil.h"
 
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/FieldReference.h"
@@ -493,6 +494,71 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     VELOX_CHECK_EQ(len, 2);
     auto const& op1 = pushExprToTree(expr->inputs()[0]);
     auto const& op2 = pushExprToTree(expr->inputs()[1]);
+
+    // cudf AST DIV truncates; Velox requires round-half-away-from-zero.
+    // Compute at a higher intermediate precision (pre_result_scale) to
+    // get extra digits.  The finalization step uses decimalRoundCast()
+    // to round from pre_result_scale down to the Velox result scale.
+    if (name == "divide" &&
+        expr->inputs()[0]->type()->isDecimal() &&
+        expr->inputs()[1]->type()->isDecimal()) {
+      auto getScale = [](const TypePtr& t) -> uint8_t {
+        if (t->kind() == TypeKind::BIGINT) {
+          return std::dynamic_pointer_cast<const ShortDecimalType>(t)->scale();
+        }
+        return std::dynamic_pointer_cast<const LongDecimalType>(t)->scale();
+      };
+      auto getPrecision = [](const TypePtr& t) -> uint8_t {
+        if (t->kind() == TypeKind::BIGINT) {
+          return std::dynamic_pointer_cast<const ShortDecimalType>(t)
+              ->precision();
+        }
+        return std::dynamic_pointer_cast<const LongDecimalType>(t)
+            ->precision();
+      };
+      uint8_t s1 = getScale(expr->inputs()[0]->type());
+      uint8_t p2 = getPrecision(expr->inputs()[1]->type());
+      uint8_t s2 = getScale(expr->inputs()[1]->type());
+      uint8_t preResultScale =
+          std::max(static_cast<uint8_t>(6), static_cast<uint8_t>(s1 + p2 + 1));
+
+      int aRescale = preResultScale - s1 + s2;
+
+      if (aRescale > 0) {
+        auto stream = cudf::get_default_stream();
+        auto mr = cudf::get_current_device_resource_ref();
+        auto cudfScale = numeric::scale_type{-static_cast<int32_t>(aRescale)};
+
+        if (aRescale <= ShortDecimalType::kMaxPrecision) {
+          auto sfValue = static_cast<int64_t>(
+              DecimalUtil::kPowersOfTen[aRescale]);
+          auto sfScalar =
+              std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+                  sfValue, cudfScale, true, stream, mr);
+          stream.synchronize();
+          auto& sfLit = tree.push(cudf::ast::literal{
+              *static_cast<cudf::fixed_point_scalar<numeric::decimal64>*>(
+                  sfScalar.get())});
+          scalars.push_back(std::move(sfScalar));
+          auto& scaled = tree.push(Operation{Op::MUL, op1, sfLit});
+          return tree.push(Operation{Op::DIV, scaled, op2});
+        } else {
+          auto sfValue = static_cast<__int128_t>(
+              DecimalUtil::kPowersOfTen[aRescale]);
+          auto sfScalar =
+              std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+                  sfValue, cudfScale, true, stream, mr);
+          stream.synchronize();
+          auto& sfLit = tree.push(cudf::ast::literal{
+              *static_cast<cudf::fixed_point_scalar<numeric::decimal128>*>(
+                  sfScalar.get())});
+          scalars.push_back(std::move(sfScalar));
+          auto& scaled = tree.push(Operation{Op::MUL, op1, sfLit});
+          return tree.push(Operation{Op::DIV, scaled, op2});
+        }
+      }
+    }
+
     return tree.push(Operation{binaryOps.at(name), op1, op2});
   } else if (unaryOps.find(name) != unaryOps.end()) {
     VELOX_CHECK_EQ(len, 1);
