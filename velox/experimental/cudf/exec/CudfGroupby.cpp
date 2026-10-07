@@ -1574,7 +1574,7 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
   VELOX_CHECK(streamingGroupbyStream_.has_value());
   const auto stream = *streamingGroupbyStream_;
   auto [groupKeys, results] =
-      streamingGroupby_->finalize(stream, get_output_mr());
+      streamingGroupby_->finalize_and_release(stream, get_output_mr());
 
   std::vector<std::unique_ptr<cudf::column>> outputColumns;
   auto keyColumns = groupKeys->release();
@@ -1597,9 +1597,6 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
       : std::make_shared<cudf_velox::CudfVector>(
             pool(), outputType_, numRows, std::move(resultTable), stream);
 
-  // libcudf finalization reads persistent state asynchronously. Its destructor
-  // has no stream parameter, so wait before releasing that state.
-  stream.sync();
   streamingGroupby_.reset();
   streamingGroupbyStream_.reset();
   streamingGroupbyEvent_.reset();
