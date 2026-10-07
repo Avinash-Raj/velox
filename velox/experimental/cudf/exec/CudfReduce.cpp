@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
@@ -456,8 +457,10 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
       uint32_t inputIndex,
       VectorPtr constant,
       const TypePtr& resultType,
-      std::optional<uint32_t> maskIndex)
-      : ReduceAggregator(step, inputIndex, constant, resultType, maskIndex) {}
+      std::optional<uint32_t> maskIndex,
+      bool compactDecimalSum)
+      : ReduceAggregator(step, inputIndex, constant, resultType, maskIndex),
+        compactDecimalSum_(compactDecimalSum) {}
 
   std::unique_ptr<cudf::column> doReduce(
       cudf::table_view const& input,
@@ -472,6 +475,13 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
         input, inputIndex, maskIndex, stream, get_temp_mr());
     cudf::column_view inputCol =
         injected ? injected->view() : input.column(inputIndex);
+    if (compactDecimalSum_) {
+      if (!exec::isRawInput(step)) {
+        VELOX_CHECK(
+            inputCol.type() == cudf_velox::veloxToCudfDataType(outputType));
+      }
+      return singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
+    }
     switch (step) {
       case core::AggregationNode::Step::kSingle:
         return singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
@@ -487,6 +497,9 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
         VELOX_NYI("Unsupported aggregation step for decimal sum reduce");
     }
   }
+
+ private:
+  const bool compactDecimalSum_;
 };
 
 struct ReduceDecimalAvgAggregator : ReduceAggregator {
@@ -737,7 +750,12 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<ReduceDecimalSumAggregator>(
-          p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
+          p.companionStep,
+          p.inputIndex,
+          p.constant,
+          p.resultType,
+          p.maskIndex,
+          p.compactDecimalSum);
     }
     return std::make_unique<ReduceSumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -811,10 +829,14 @@ bool canReduceBeEvaluatedByCudf(
   // Get the aggregation step from the node
   auto step = aggregationNode.step();
 
-  // Check supported aggregation functions using reduce registry
-  for (const auto& aggregate : aggregationNode.aggregates()) {
-    // Use step-aware validation that handles partial/final/intermediate steps
-    if (!canReduceAggregationBeEvaluatedByCudf(
+  const auto* cudfNode =
+      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
+  // Compact signatures are validated by CudfAggregationNode, not the legacy
+  // registry whose decimal intermediate type is VARBINARY.
+  for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
+    const auto& aggregate = aggregationNode.aggregates()[i];
+    if (!(cudfNode && cudfNode->usesCompactDecimalSum(i)) &&
+        !canReduceAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
       return false;
     }

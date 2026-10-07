@@ -16,6 +16,7 @@ add_library(
   velox_cudf_exec
   AggregationRegistry.cpp
   CudfAggregation.cpp
+  CudfAggregationNode.cpp
   CudfAssignUniqueId.cpp
   CudfBatchConcat.cpp
   CudfConversion.cpp
@@ -33,6 +34,7 @@ add_library(
   CudfMarkDistinct.cpp
   CudfNestedLoopJoin.cpp
   CudfOrderBy.cpp
+  CudfPlanRewriter.cpp
   CudfReduce.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp

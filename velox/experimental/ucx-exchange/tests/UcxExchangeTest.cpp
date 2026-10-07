@@ -24,6 +24,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/Synchronized.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/synchronization/EventCount.h>
@@ -37,29 +38,38 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/QueryConfig.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/PortUtil.h"
 #include "velox/exec/tests/utils/QueryAssertions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
+#include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+#include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/SourceDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/UcxPartitionedOutputMock.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestData.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
+#include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
+#include "velox/parse/TypeResolver.h"
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/vector/tests/utils/VectorMaker.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -958,6 +968,190 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
   queueManager()->removeTask(srcTaskId);
 
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputDataIntegrityTest";
+}
+
+TEST_F(UcxExchangeFocusedTest, compactDecimalSumAcrossTasks) {
+  using cudf_velox::CudfAggregationNode;
+  using cudf_velox::CudfPlanRewriter;
+
+  ASSERT_FALSE(cudf_velox::cudfIsRegistered());
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedConfig = config;
+  const auto savedResource = cudf::get_current_device_resource_ref();
+  auto savedOutputResource = cudf_velox::output_mr_;
+  SCOPE_EXIT {
+    cudf::set_current_device_resource(savedResource);
+    cudf_velox::unregisterCudf();
+    cudf_velox::output_mr_ = std::move(savedOutputResource);
+    config = savedConfig;
+  };
+  config.allowCpuFallback = false;
+  // Exercise packed UCX data, not table sharing.
+  config.intraNodeExchange = false;
+  config.functionNamePrefix = "";
+  config.memoryResource = "cuda";
+  config.outputMemoryResource = "";
+  parse::registerTypeResolver();
+  aggregate::prestosql::registerAllAggregateFunctions();
+  cudf_velox::registerCudf();
+
+  auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(4);
+  auto queryCtx = core::QueryCtx::create(
+      executor.get(),
+      core::QueryConfig({{cudf_velox::CudfConfig::kCudfEnabled, "true"}}));
+  auto outputs = OutputTransportRegistry::create();
+  outputs->insert(
+      std::string{TransportKind::kUcx},
+      OutputTransportEntry::make<UcxOutputQueueManager>(
+          queueManager(),
+          [](int32_t id,
+             DriverCtx* ctx,
+             const std::shared_ptr<const PartitionedOutputNode>& node,
+             bool /*eagerFlush*/,
+             const std::shared_ptr<UcxOutputQueueManager>& manager) {
+            return std::make_unique<UcxPartitionedOutput>(
+                id, ctx, node, manager);
+          }));
+  queryCtx->setRegistry(OutputTransportRegistry::kRegistryKey, outputs);
+  auto exchanges = ExchangeTransportRegistry::create();
+  exchanges->insert(
+      std::string{TransportKind::kUcx},
+      ExchangeTransportEntry::make<UcxExchangeClient>(
+          [](const ExchangeClientContext& ctx) {
+            return std::make_shared<UcxExchangeClient>(
+                ctx.taskId, ctx.destination, ctx.numberOfConsumers);
+          },
+          [](int32_t id,
+             DriverCtx* ctx,
+             const std::shared_ptr<const ExchangeNode>& node,
+             const std::shared_ptr<UcxExchangeClient>& client) {
+            return std::make_unique<UcxExchange>(id, ctx, node, client);
+          }));
+  queryCtx->setRegistry(ExchangeTransportRegistry::kRegistryKey, exchanges);
+
+  facebook::velox::test::VectorMaker vectors(pool_.get());
+  const auto rawType = DECIMAL(18, 2);
+  const auto stateType = DECIMAL(38, 2);
+  constexpr int64_t large = 999'999'999'999'999'999;
+  // k=0 exceeds INT64 after merging tasks; k=1 is all-null; k=2 is
+  // a valid zero; k=3 has a null partial on only one producer.
+  auto keys = vectors.flatVector<int32_t>({0, 0, 0, 0, 0, 1, 2, 3});
+  std::vector<RowVectorPtr> inputs{
+      vectors.rowVector(
+          {"k", "d"},
+          {keys,
+           vectors.flatVectorNullable<int64_t>(
+               {large,
+                large,
+                large,
+                large,
+                large,
+                std::nullopt,
+                125,
+                std::nullopt},
+               rawType)}),
+      vectors.rowVector(
+          {"k", "d"},
+          {keys,
+           vectors.flatVectorNullable<int64_t>(
+               {large, large, large, large, large, std::nullopt, -125, 75},
+               rawType)})};
+  const auto taskPrefix = getUniqueTaskPrefix();
+  std::vector<std::shared_ptr<Task>> producers;
+  SCOPE_EXIT {
+    for (auto& task : producers) {
+      if (task->isRunning()) {
+        task->requestAbort().wait();
+      }
+      EXPECT_TRUE(exec::waitForTaskDriversToFinish(task.get()));
+      queueManager()->removeTask(task->taskId());
+    }
+  };
+  RowTypePtr legacyStateType;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    auto plan =
+        exec::test::PlanBuilder()
+            .values({inputs[i]})
+            .partialAggregation({"k"}, {"sum(d) AS s"})
+            .partitionedOutput(
+                {}, 1, false, {}, "Presto", std::string{TransportKind::kUcx})
+            .planNode();
+    legacyStateType = plan->outputType();
+    auto rewritten = CudfPlanRewriter::rewrite(plan);
+    ASSERT_NE(
+        dynamic_cast<const PartitionedOutputNode*>(rewritten.get()), nullptr);
+    auto* partial =
+        dynamic_cast<const CudfAggregationNode*>(rewritten->sources()[0].get());
+    ASSERT_NE(partial, nullptr);
+    ASSERT_EQ(*partial->intermediateType(0), *stateType);
+    ASSERT_EQ(*rewritten->outputType()->childAt(1), *stateType);
+    producers.push_back(
+        Task::create(
+            taskPrefix + "compactSumProducer" + std::to_string(i),
+            PlanFragment(rewritten),
+            0,
+            queryCtx,
+            Task::ExecutionMode::kParallel));
+    producers.back()->start(1);
+  }
+
+  PlanNodeId exchangeId;
+  auto consumer =
+      exec::test::PlanBuilder()
+          .exchange(legacyStateType, "Presto", std::string{TransportKind::kUcx})
+          .capturePlanNodeId(exchangeId)
+          .finalAggregation({"k"}, {"sum(s) AS s"}, {{rawType}})
+          .planNode();
+  auto rewrittenConsumer = CudfPlanRewriter::rewrite(consumer);
+  auto* exchange =
+      dynamic_cast<const ExchangeNode*>(rewrittenConsumer->sources()[0].get());
+  ASSERT_NE(exchange, nullptr);
+  ASSERT_EQ(exchange->name(), "Exchange");
+  ASSERT_EQ(*exchange->outputType()->childAt(1), *stateType);
+  ASSERT_EQ(
+      *exchange->outputType(),
+      *producers[0]->planFragment().planNode->outputType());
+
+  CursorParameters params;
+  params.planNode = rewrittenConsumer;
+  params.queryCtx = queryCtx;
+  params.maxDrivers = 1;
+  auto [cursor, results] =
+      exec::test::readCursor(params, [&](TaskCursor* cursor) {
+        if (cursor->noMoreSplits()) {
+          return;
+        }
+        for (const auto& producer : producers) {
+          cursor->task()->addSplit(
+              exchangeId, remoteSplit(producer->taskId(), 0));
+        }
+        cursor->task()->noMoreSplits(exchangeId);
+        cursor->setNoMoreSplits();
+      });
+  auto expected = vectors.rowVector(
+      {"k", "s"},
+      {vectors.flatVector<int32_t>({0, 1, 2, 3}),
+       vectors.flatVectorNullable<int128_t>(
+           {int128_t{large} * 10, std::nullopt, 0, 75}, stateType)});
+  ASSERT_TRUE(exec::test::assertEqualResults({expected}, results));
+  auto hasOperator = [](const std::shared_ptr<Task>& task,
+                        std::string_view type) {
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        if (op.operatorType == type) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  EXPECT_TRUE(hasOperator(cursor->task(), "UcxExchange"));
+  EXPECT_TRUE(hasOperator(cursor->task(), "CudfGroupbyFINAL"));
+  for (const auto& producer : producers) {
+    ASSERT_TRUE(exec::test::waitForTaskCompletion(producer.get()));
+    EXPECT_TRUE(hasOperator(producer, "cudfPartitionedOutput"));
+    EXPECT_TRUE(hasOperator(producer, "CudfGroupbyPARTIAL"));
+  }
 }
 
 // Focused regression test for shared UcxExchangeClient ownership. This

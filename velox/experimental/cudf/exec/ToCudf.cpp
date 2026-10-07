@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
@@ -114,6 +115,26 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
         }
+        // UCX operators live outside cuDF: use their operator names and verify
+        // the explicit transport contract without linking to the UCX library.
+        if (op->operatorType() == "UcxExchange") {
+          auto exchange = dynamic_cast<const core::ExchangeNode*>(
+              props.planNode.get());
+          VELOX_CHECK(
+              exchange &&
+              exchange->transportKind() == core::TransportKind::kUcx);
+          props.canRunOnGPU = true;
+          props.acceptsGpuInput = false;
+          props.producesGpuOutput = true;
+        } else if (op->operatorType() == "cudfPartitionedOutput") {
+          auto output = dynamic_cast<const core::PartitionedOutputNode*>(
+              props.planNode.get());
+          VELOX_CHECK(
+              output && output->transportKind() == core::TransportKind::kUcx);
+          props.canRunOnGPU = true;
+          props.acceptsGpuInput = true;
+          props.producesGpuOutput = false;
+        }
         // Reject operators whose output types cannot be represented in cuDF.
         if (props.planNode &&
             !isTypeSupportedByCudf(props.planNode->outputType())) {
@@ -121,6 +142,10 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.acceptsGpuInput = false;
           props.producesGpuOutput = false;
         }
+        VELOX_USER_CHECK(
+            !dynamic_cast<const CudfAggregationNode*>(props.planNode.get()) ||
+                props.canRunOnGPU,
+            "Compact aggregation state requires GPU execution; CPU fallback is not supported");
         return props;
       };
 
@@ -235,8 +260,8 @@ bool CompileState::compile(bool allowCpuFallback) {
         isPureCpuOperator = false;
       }
     } else {
-      // special case for CudfOperator
-      if (isAnyOf<CudfOperator>(oper)) {
+      // Already-GPU operators (including UCX) are kept, not replaced.
+      if (thisOpProps.canRunOnGPU) {
         isPureCpuOperator = false;
       } else {
         // CPU operator without adapter
@@ -322,9 +347,20 @@ struct CudfDriverAdapter {
         CudfConfig::kCudfAllowCpuFallback,
         CudfConfig::getInstance().allowCpuFallback);
     if (!queryConfig.get<bool>(
-            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled) &&
-        allowCpuFallback) {
-      return false;
+            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled)) {
+      const auto isCompactAggregation = [](const core::PlanNodePtr& node) {
+        return dynamic_cast<const CudfAggregationNode*>(node.get()) != nullptr;
+      };
+      VELOX_USER_CHECK(
+          !std::any_of(
+              factory.planNodes.begin(),
+              factory.planNodes.end(),
+              isCompactAggregation) &&
+              !isCompactAggregation(factory.consumerNode),
+          "Compact aggregation state requires cuDF to be enabled");
+      if (allowCpuFallback) {
+        return false;
+      }
     }
     auto state = CompileState(factory, driver);
     return state.compile(allowCpuFallback);
@@ -341,6 +377,8 @@ void registerCudf() {
   if (cudfIsRegistered()) {
     return;
   }
+
+  CudfAggregationNode::registerSerDe();
 
   // Register operator adapters
   registerAllOperatorAdapters();

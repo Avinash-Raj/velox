@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
@@ -443,15 +444,25 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       uint32_t inputIndex,
       VectorPtr constant,
       const TypePtr& resultType,
-      std::optional<uint32_t> maskIndex)
-      : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex) {}
+      std::optional<uint32_t> maskIndex,
+      bool compactDecimalSum)
+      : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex),
+        compactDecimalSum_(compactDecimalSum) {}
 
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    if (step == core::AggregationNode::Step::kIntermediate) {
+    if (compactDecimalSum_) {
+      auto input = materializeMaskedInput(tbl, inputIndex, stream, mr);
+      if (!exec::isRawInput(step)) {
+        VELOX_CHECK(
+            input.type() == cudf_velox::veloxToCudfDataType(resultType));
+      }
+      addDecimalRawPartialSingleSumRequest(
+          input, requests, false, stream, sumIdx_, castedInput_);
+    } else if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
           inputIndex,
@@ -485,6 +496,9 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
+    if (compactDecimalSum_) {
+      return col;
+    }
     if (step == core::AggregationNode::Step::kPartial) {
       auto count = std::move(results[sumIdx_].results[1]);
       return serializeDecimalPartialOrIntermediateState(
@@ -517,6 +531,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
   // alive while the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
+  const bool compactDecimalSum_;
 };
 
 struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
@@ -1064,7 +1079,12 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<GroupbyDecimalSumAggregator>(
-          p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
+          p.companionStep,
+          p.inputIndex,
+          p.constant,
+          p.resultType,
+          p.maskIndex,
+          p.compactDecimalSum);
     }
     return std::make_unique<GroupbySumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -1286,10 +1306,14 @@ bool canGroupbyBeEvaluatedByCudf(
   // Get the aggregation step from the node
   auto step = aggregationNode.step();
 
-  // Check supported aggregation functions using step-aware aggregation registry
-  for (const auto& aggregate : aggregationNode.aggregates()) {
-    // Use step-aware validation that handles partial/final/intermediate steps
-    if (!canGroupbyAggregationBeEvaluatedByCudf(
+  const auto* cudfNode =
+      dynamic_cast<const CudfAggregationNode*>(&aggregationNode);
+  // Compact signatures are validated by CudfAggregationNode, not the legacy
+  // registry whose decimal intermediate type is VARBINARY.
+  for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
+    const auto& aggregate = aggregationNode.aggregates()[i];
+    if (!(cudfNode && cudfNode->usesCompactDecimalSum(i)) &&
+        !canGroupbyAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
       return false;
     }
