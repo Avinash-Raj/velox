@@ -140,6 +140,13 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_decimal_sync_benchmark
+  SOURCES Main.cpp DecimalOverflowSyncBenchmark.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+  TIMEOUT 3000
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_enforce_single_row_test
   SOURCES Main.cpp EnforceSingleRowTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS}
