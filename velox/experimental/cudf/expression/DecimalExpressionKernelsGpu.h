@@ -21,11 +21,15 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/device_uvector.hpp>
+#include <rmm/resource_ref.hpp>
+
 #include <cuda/stream>
 
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -37,6 +41,72 @@ enum class DecimalBinaryOpStatus : int32_t {
   kOk = 0,
   kOverflow = 1,
   kDivisionByZero = 2,
+};
+
+/// A decimal literal operand decoded on the host once, so the per-batch
+/// kernels take it by value instead of reading the cuDF scalar back from the
+/// device on every call.
+struct DecimalScalarValue {
+  cudf::data_type type;
+  bool valid;
+  __int128_t value;
+};
+
+/// Decodes a DECIMAL64 or DECIMAL128 cuDF scalar. Reads the device-resident
+/// validity and value, so it synchronizes \p stream.
+DecimalScalarValue decodeDecimalScalar(
+    const cudf::scalar& scalar,
+    cuda::stream_ref stream);
+
+/// Collects the status of every checked decimal kernel launched on one stream,
+/// so the host reads them all with one synchronization instead of one per
+/// launch.
+///
+/// While a ScopedDeferredDecimalStatus is active on the calling thread, a
+/// launch on stream() records into its own flag and returns without
+/// synchronizing. check() then raises the error of the first failing launch in
+/// launch order, which is the error an immediate per-launch check would have
+/// raised: later launches may compute on the placeholder values a failed launch
+/// wrote, but they cannot change which error is reported.
+class DeferredDecimalStatus {
+ public:
+  DeferredDecimalStatus(
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr);
+
+  /// Collector active on the calling thread, or nullptr.
+  static DeferredDecimalStatus* current();
+
+  cuda::stream_ref stream() const {
+    return stream_;
+  }
+
+  /// Returns a zeroed device flag for one launch of \p op on stream().
+  int32_t* reserve(cudf::binary_operator op);
+
+  /// Reads every recorded flag with one synchronization of stream() and throws
+  /// the error of the first failing launch.
+  void check();
+
+ private:
+  cuda::stream_ref stream_;
+  rmm::device_async_resource_ref mr_;
+  rmm::device_uvector<int32_t> flags_;
+  std::vector<cudf::binary_operator> ops_;
+};
+
+/// Makes \p status the calling thread's collector for its lifetime.
+class ScopedDeferredDecimalStatus {
+ public:
+  explicit ScopedDeferredDecimalStatus(DeferredDecimalStatus& status);
+  ~ScopedDeferredDecimalStatus();
+
+  ScopedDeferredDecimalStatus(const ScopedDeferredDecimalStatus&) = delete;
+  ScopedDeferredDecimalStatus& operator=(const ScopedDeferredDecimalStatus&) =
+      delete;
+
+ private:
+  DeferredDecimalStatus* previous_;
 };
 
 // CUDA implementations that return {result, status}. The status is tracked with
@@ -56,7 +126,7 @@ decimalBinaryOperationWithOverflow(
 std::pair<std::unique_ptr<cudf::column>, DecimalBinaryOpStatus>
 decimalBinaryOperationWithOverflow(
     const cudf::column_view& lhs,
-    const cudf::scalar& rhs,
+    const DecimalScalarValue& rhs,
     cudf::binary_operator op,
     cudf::data_type outputType,
     int32_t outputPrecision,
@@ -65,7 +135,7 @@ decimalBinaryOperationWithOverflow(
 
 std::pair<std::unique_ptr<cudf::column>, DecimalBinaryOpStatus>
 decimalBinaryOperationWithOverflow(
-    const cudf::scalar& lhs,
+    const DecimalScalarValue& lhs,
     const cudf::column_view& rhs,
     cudf::binary_operator op,
     cudf::data_type outputType,
@@ -74,6 +144,10 @@ decimalBinaryOperationWithOverflow(
     rmm::device_async_resource_ref mr);
 
 namespace detail {
+
+/// Maps the raw status bits a checked decimal kernel ORs into its flag to a
+/// DecimalBinaryOpStatus.
+DecimalBinaryOpStatus decodeDecimalBinaryOpStatus(int32_t flag);
 
 /**
  * @brief Decodes a cuDF decimal scalar into a raw __int128_t payload.

@@ -22,8 +22,15 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/span.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -94,7 +101,68 @@ void checkDecimalDivideTypes(cudf::type_id inType, cudf::type_id outType) {
   }
 }
 
+constexpr size_t kInitialDeferredFlags = 32;
+
+thread_local DeferredDecimalStatus* currentDeferredStatus = nullptr;
+
 } // namespace
+
+DeferredDecimalStatus::DeferredDecimalStatus(
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr)
+    : stream_(stream), mr_(mr), flags_(0, stream, mr) {}
+
+DeferredDecimalStatus* DeferredDecimalStatus::current() {
+  return currentDeferredStatus;
+}
+
+int32_t* DeferredDecimalStatus::reserve(cudf::binary_operator op) {
+  if (ops_.size() == flags_.size()) {
+    // Flags handed out earlier point into the old buffer. Their kernels are
+    // ordered before this copy on stream_, and the old buffer is freed
+    // stream-ordered after it, so their writes are carried over.
+    rmm::device_uvector<int32_t> grown(
+        std::max(kInitialDeferredFlags, flags_.size() * 2), stream_, mr_);
+    if (!flags_.is_empty()) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          grown.data(),
+          flags_.data(),
+          flags_.size() * sizeof(int32_t),
+          cudaMemcpyDeviceToDevice,
+          stream_.get()));
+    }
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+        grown.data() + flags_.size(),
+        0,
+        (grown.size() - flags_.size()) * sizeof(int32_t),
+        stream_.get()));
+    flags_ = std::move(grown);
+  }
+  ops_.push_back(op);
+  return flags_.data() + ops_.size() - 1;
+}
+
+void DeferredDecimalStatus::check() {
+  if (ops_.empty()) {
+    return;
+  }
+  auto const flags = cudf::detail::make_std_vector(
+      cudf::device_span<int32_t const>{flags_.data(), ops_.size()}, stream_);
+  for (size_t i = 0; i < ops_.size(); ++i) {
+    checkDecimalBinaryOpStatus(
+        detail::decodeDecimalBinaryOpStatus(flags[i]), ops_[i]);
+  }
+}
+
+ScopedDeferredDecimalStatus::ScopedDeferredDecimalStatus(
+    DeferredDecimalStatus& status)
+    : previous_(currentDeferredStatus) {
+  currentDeferredStatus = &status;
+}
+
+ScopedDeferredDecimalStatus::~ScopedDeferredDecimalStatus() {
+  currentDeferredStatus = previous_;
+}
 
 template <typename Lhs, typename Rhs>
 std::unique_ptr<cudf::column> decimalBinaryOperation(
@@ -122,7 +190,7 @@ template std::unique_ptr<cudf::column> decimalBinaryOperation(
 
 template std::unique_ptr<cudf::column> decimalBinaryOperation(
     const cudf::column_view&,
-    const cudf::scalar&,
+    const DecimalScalarValue&,
     cudf::binary_operator,
     cudf::data_type,
     int32_t,
@@ -130,7 +198,7 @@ template std::unique_ptr<cudf::column> decimalBinaryOperation(
     rmm::device_async_resource_ref);
 
 template std::unique_ptr<cudf::column> decimalBinaryOperation(
-    const cudf::scalar&,
+    const DecimalScalarValue&,
     const cudf::column_view&,
     cudf::binary_operator,
     cudf::data_type,
@@ -188,7 +256,7 @@ std::unique_ptr<cudf::column> decimalDivide(
 
 std::unique_ptr<cudf::column> decimalDivide(
     const cudf::column_view& lhs,
-    const cudf::scalar& rhs,
+    const DecimalScalarValue& rhs,
     cudf::data_type outputType,
     int32_t aRescale,
     cuda::stream_ref stream,
@@ -203,7 +271,7 @@ std::unique_ptr<cudf::column> decimalDivide(
       "{}",
       decimalOverflowMessage(cudf::binary_operator::DIV));
 
-  if (!rhs.is_valid(stream)) {
+  if (!rhs.valid) {
     return makeAllNullDecimalColumn(outputType, lhs.size(), stream, mr);
   }
 
@@ -217,8 +285,6 @@ std::unique_ptr<cudf::column> decimalDivide(
       stream,
       mr);
 
-  auto rhsValue = detail::getDecimalScalarValue(rhs, stream);
-
   const auto inType = lhs.type().id();
   const auto outType = outputType.id();
   checkDecimalDivideTypes(inType, outType);
@@ -228,7 +294,7 @@ std::unique_ptr<cudf::column> decimalDivide(
           inType,
           outType,
           lhs,
-          rhsValue,
+          rhs.value,
           out->mutable_view(),
           DecimalUtil::kPowersOfTen[aRescale],
           stream),
@@ -238,7 +304,7 @@ std::unique_ptr<cudf::column> decimalDivide(
 }
 
 std::unique_ptr<cudf::column> decimalDivide(
-    const cudf::scalar& lhs,
+    const DecimalScalarValue& lhs,
     const cudf::column_view& rhs,
     cudf::data_type outputType,
     int32_t aRescale,
@@ -254,7 +320,7 @@ std::unique_ptr<cudf::column> decimalDivide(
       "{}",
       decimalOverflowMessage(cudf::binary_operator::DIV));
 
-  if (!lhs.is_valid(stream)) {
+  if (!lhs.valid) {
     return makeAllNullDecimalColumn(outputType, rhs.size(), stream, mr);
   }
 
@@ -268,8 +334,6 @@ std::unique_ptr<cudf::column> decimalDivide(
       stream,
       mr);
 
-  auto lhsValue = detail::getDecimalScalarValue(lhs, stream);
-
   const auto inType = rhs.type().id();
   const auto outType = outputType.id();
   checkDecimalDivideTypes(inType, outType);
@@ -279,7 +343,7 @@ std::unique_ptr<cudf::column> decimalDivide(
       detail::decimalDivideScalarColumn(
           inType,
           outType,
-          lhsValue,
+          lhs.value,
           rhs,
           out->mutable_view(),
           rescaleFactor,

@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/expression/DecimalExpressionKernelsGpu.h"
+
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -60,7 +62,7 @@ std::unique_ptr<cudf::column> decimalDivide(
  * zero divisor fails the batch with "Division by zero".
  *
  * @param lhs Left-hand decimal operand column.
- * @param rhs Right-hand decimal operand scalar.
+ * @param rhs Right-hand decimal operand, decoded on the host.
  * @param outputType Output decimal type including precision and scale.
  * @param aRescale Fixed-point scale adjustment (Velox passes outScale -
  * lhsScale + rhsScale), used inside the kernel as a power-of-ten factor.
@@ -70,7 +72,7 @@ std::unique_ptr<cudf::column> decimalDivide(
  */
 std::unique_ptr<cudf::column> decimalDivide(
     const cudf::column_view& lhs,
-    const cudf::scalar& rhs,
+    const DecimalScalarValue& rhs,
     cudf::data_type outputType,
     int32_t aRescale,
     cuda::stream_ref stream,
@@ -83,7 +85,7 @@ std::unique_ptr<cudf::column> decimalDivide(
  * output stencil before the kernel. A zero divisor fails the batch with
  * "Division by zero".
  *
- * @param lhs Left-hand decimal operand scalar.
+ * @param lhs Left-hand decimal operand, decoded on the host.
  * @param rhs Right-hand decimal operand column.
  * @param outputType Output decimal type including precision and scale.
  * @param aRescale Fixed-point scale adjustment (Velox passes outScale -
@@ -93,7 +95,7 @@ std::unique_ptr<cudf::column> decimalDivide(
  * @return Column containing the divided decimal values.
  */
 std::unique_ptr<cudf::column> decimalDivide(
-    const cudf::scalar& lhs,
+    const DecimalScalarValue& lhs,
     const cudf::column_view& rhs,
     cudf::data_type outputType,
     int32_t aRescale,

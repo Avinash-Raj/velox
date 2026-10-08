@@ -74,30 +74,12 @@
 #include <cctype>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
 
 // Implementation details in anonymous namespace
 namespace {
-
-bool decimalScalarIsZero(const cudf::scalar& scalar, cuda::stream_ref stream) {
-  if (!scalar.is_valid(stream)) {
-    return false;
-  }
-  if (scalar.type().id() == cudf::type_id::DECIMAL64) {
-    auto const& dec =
-        static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(
-            scalar);
-    return dec.value(stream) == 0;
-  }
-  if (scalar.type().id() == cudf::type_id::DECIMAL128) {
-    auto const& dec =
-        static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(
-            scalar);
-    return dec.value(stream) == 0;
-  }
-  return false;
-}
 
 bool hasDecimalZero(
     const cudf::column_view& col,
@@ -637,6 +619,18 @@ class BinaryFunction : public CudfFunction {
     VELOX_CHECK(
         !(left_ != nullptr && right_ != nullptr),
         "Binary function on two literals is not supported");
+
+    if (decimalPrecision_ != 0) {
+      auto decodeLiteral = [](const std::unique_ptr<cudf::scalar>& scalar)
+          -> std::optional<DecimalScalarValue> {
+        if (scalar == nullptr || !cudf::is_fixed_point(scalar->type())) {
+          return std::nullopt;
+        }
+        return decodeDecimalScalar(*scalar, getDefaultStreamForCurrentThread());
+      };
+      leftDecimal_ = decodeLiteral(left_);
+      rightDecimal_ = decodeLiteral(right_);
+    }
   }
 
   ColumnOrView eval(
@@ -731,7 +725,8 @@ class BinaryFunction : public CudfFunction {
       return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
     } else if (left_ == nullptr) {
       if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
-        if (decimalScalarIsZero(*right_, stream)) {
+        VELOX_CHECK(rightDecimal_.has_value());
+        if (rightDecimal_->valid && rightDecimal_->value == 0) {
           VELOX_USER_FAIL("Division by zero");
         }
         auto lhsView = asView(inputColumns[0]);
@@ -750,8 +745,8 @@ class BinaryFunction : public CudfFunction {
         auto rhsScale = -right_->type().scale();
         auto outScale = -type_.scale();
         auto aRescale = outScale - lhsScale + rhsScale;
-        auto result =
-            decimalDivide(lhsView, *right_, workingType, aRescale, stream, mr);
+        auto result = decimalDivide(
+            lhsView, *rightDecimal_, workingType, aRescale, stream, mr);
         return finalizeDecimalDivision(std::move(result), type_, stream, mr);
       }
       auto lhsView = asView(inputColumns[0]);
@@ -785,8 +780,15 @@ class BinaryFunction : public CudfFunction {
             op_ == cudf::binary_operator::MOD) {
           // Operand widths and scales are handled by the checked kernel (see
           // the column/column path above).
+          VELOX_CHECK(rightDecimal_.has_value());
           return decimalBinaryOperation(
-              lhsView, *right_, op_, type_, decimalPrecision_, stream, mr);
+              lhsView,
+              *rightDecimal_,
+              op_,
+              type_,
+              decimalPrecision_,
+              stream,
+              mr);
         }
       }
       return cudf::binary_operation(
@@ -809,8 +811,9 @@ class BinaryFunction : public CudfFunction {
       auto rhsScale = -rhsView.type().scale();
       auto outScale = -type_.scale();
       auto aRescale = outScale - lhsScale + rhsScale;
-      auto result =
-          decimalDivide(*left_, rhsView, workingType, aRescale, stream, mr);
+      VELOX_CHECK(leftDecimal_.has_value());
+      auto result = decimalDivide(
+          *leftDecimal_, rhsView, workingType, aRescale, stream, mr);
       return finalizeDecimalDivision(std::move(result), type_, stream, mr);
     }
     auto rhsView = asView(inputColumns[0]);
@@ -844,8 +847,9 @@ class BinaryFunction : public CudfFunction {
           op_ == cudf::binary_operator::MOD) {
         // Operand widths and scales are handled by the checked kernel (see the
         // column/column path above).
+        VELOX_CHECK(leftDecimal_.has_value());
         return decimalBinaryOperation(
-            *left_, rhsView, op_, type_, decimalPrecision_, stream, mr);
+            *leftDecimal_, rhsView, op_, type_, decimalPrecision_, stream, mr);
       }
     }
     return cudf::binary_operation(*left_, rhsView, op_, type_, stream, mr);
@@ -857,6 +861,10 @@ class BinaryFunction : public CudfFunction {
   int32_t decimalPrecision_{0};
   std::unique_ptr<cudf::scalar> left_;
   std::unique_ptr<cudf::scalar> right_;
+  // Decimal literals of checked decimal arithmetic, decoded once so each batch
+  // passes them to the kernels without a device-to-host read.
+  std::optional<DecimalScalarValue> leftDecimal_;
+  std::optional<DecimalScalarValue> rightDecimal_;
 };
 
 // @TODO 4/22/26

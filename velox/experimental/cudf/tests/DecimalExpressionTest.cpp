@@ -2398,6 +2398,71 @@ TEST_F(CudfDecimalTest, decimalMultiRowOverflowFlag) {
       "Decimal overflow in add");
 }
 
+// The batch status is read once, after every op has run, so later ops compute
+// on the placeholder a failed op wrote. Here a * b = 1e38 overflows and its
+// placeholder 0 reaches the divide as a zero divisor; the reported error must
+// still be the multiply, the first op that failed.
+TEST_F(CudfDecimalTest, decimalBatchStatusReportsFirstFailingOp) {
+  auto input = makeRowVector(
+      {"x", "a", "b"},
+      {
+          makeFlatVector<int128_t>({1}, DECIMAL(38, 0)),
+          makeFlatVector<int128_t>(
+              {DecimalUtil::kPowersOfTen[19]}, DECIMAL(38, 0)),
+          makeFlatVector<int128_t>(
+              {DecimalUtil::kPowersOfTen[19]}, DECIMAL(38, 0)),
+      });
+  std::vector<RowVectorPtr> vectors = {input};
+
+  auto plan = exec::test::PlanBuilder()
+                  .values(vectors)
+                  .project({"x / (a * b) AS result"})
+                  .planNode();
+
+  unregisterCudf();
+  VELOX_ASSERT_USER_THROW(
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+      "overflow");
+  registerCudf();
+  VELOX_ASSERT_USER_THROW(
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+      "Decimal overflow in multiply");
+}
+
+// More checked ops than the batch status starts with room for: the failing
+// multiply records first, and the status must keep its result when it grows
+// for the additions that follow.
+TEST_F(CudfDecimalTest, decimalBatchStatusKeepsEarlyFailureWhenGrowing) {
+  auto input = makeRowVector(
+      {"a", "b", "c"},
+      {
+          makeFlatVector<int128_t>(
+              {DecimalUtil::kPowersOfTen[19]}, DECIMAL(38, 0)),
+          makeFlatVector<int128_t>(
+              {DecimalUtil::kPowersOfTen[19]}, DECIMAL(38, 0)),
+          makeFlatVector<int128_t>({1}, DECIMAL(38, 0)),
+      });
+  std::vector<RowVectorPtr> vectors = {input};
+
+  std::string projection = "a * b";
+  for (int i = 0; i < 40; ++i) {
+    projection += " + c";
+  }
+  auto plan = exec::test::PlanBuilder()
+                  .values(vectors)
+                  .project({projection + " AS result"})
+                  .planNode();
+
+  unregisterCudf();
+  VELOX_ASSERT_USER_THROW(
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+      "overflow");
+  registerCudf();
+  VELOX_ASSERT_USER_THROW(
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+      "Decimal overflow in multiply");
+}
+
 // Null-masked overflow must not fail the batch: only null rows hold the
 // overflowing value (complement of decimalMultiRowOverflowFlag). Build valid
 // vectors then setNull() so big stays under the null bit (isNullAt zeroes it).

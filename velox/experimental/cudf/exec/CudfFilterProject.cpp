@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/DecimalExpressionKernelsGpu.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -231,13 +232,21 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
 
-  if (hasFilter_) {
-    filter(inputTableColumns, stream);
+  // Checked decimal kernels record their status here instead of synchronizing
+  // per op; the batch is checked once before any of its output leaves.
+  DeferredDecimalStatus decimalStatus{stream, get_temp_mr()};
+  std::vector<std::unique_ptr<cudf::column>> outputColumns;
+  {
+    ScopedDeferredDecimalStatus deferDecimalStatus{decimalStatus};
+    if (hasFilter_) {
+      filter(inputTableColumns, stream);
+    }
+    if (!inputTableColumns.empty()) {
+      outputSize = inputTableColumns.front()->size();
+    }
+    outputColumns = project(inputTableColumns, stream);
   }
-  if (!inputTableColumns.empty()) {
-    outputSize = inputTableColumns.front()->size();
-  }
-  auto outputColumns = project(inputTableColumns, stream);
+  decimalStatus.check();
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
