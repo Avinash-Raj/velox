@@ -1996,7 +1996,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal64) {
   auto countCol = makeInt64Column(counts, &countValid, stream);
   auto stateCol =
       serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
-  auto sumAndCount = deserializeDecimalSumState(stateCol->view(), 2, stream);
+  auto sumAndCount =
+      deserializeDecimalSumState(stateCol->view(), 2, stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
   auto sumMask = copyNullMask(sumAndCount.sum->view(), stream);
   EXPECT_EQ(stateMask, sumMask);
@@ -2027,7 +2028,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal128) {
   auto countCol = makeInt64Column(counts, &countValid, stream);
   auto stateCol =
       serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
-  auto sumAndCount = deserializeDecimalSumState(stateCol->view(), 3, stream);
+  auto sumAndCount =
+      deserializeDecimalSumState(stateCol->view(), 3, stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
   auto sumMask = copyNullMask(sumAndCount.sum->view(), stream);
   EXPECT_EQ(stateMask, sumMask);
@@ -2080,7 +2082,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStatePartialNullCompact) {
       strings.chars_size(stream),
       static_cast<int64_t>(sums.size()) * 32); // 32 == kDecimalSumStateSize
 
-  auto result = deserializeDecimalSumState(compactStateView, 2, stream);
+  auto result = deserializeDecimalSumState(compactStateView, 2, stream, mr);
 
   auto outSum = copyColumnData<__int128_t>(result.sum->view(), stream);
   auto outCount = copyColumnData<int64_t>(result.count->view(), stream);
@@ -2238,7 +2240,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateMixedNullEncodings) {
       (numRows - nullCount) * 32); // 32 == kDecimalSumStateSize
   EXPECT_LT(mixedStrings.chars_size(stream), numRows * 32);
 
-  auto result = deserializeDecimalSumState(mixed->view(), 2, stream);
+  auto result = deserializeDecimalSumState(mixed->view(), 2, stream, mr);
 
   auto outSum = copyColumnData<__int128_t>(result.sum->view(), stream);
   auto outCount = copyColumnData<int64_t>(result.count->view(), stream);
@@ -2288,7 +2290,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateTrailingNullCompact) {
   cudf::strings_column_view strings(compactStateView);
   EXPECT_LT(strings.chars_size(stream), static_cast<int64_t>(sums.size()) * 32);
 
-  auto result = deserializeDecimalSumState(compactStateView, 2, stream);
+  auto result = deserializeDecimalSumState(compactStateView, 2, stream, mr);
 
   auto outSum = copyColumnData<__int128_t>(result.sum->view(), stream);
   auto outCount = copyColumnData<int64_t>(result.count->view(), stream);
@@ -2332,7 +2334,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateLeadingNullCompact) {
   cudf::strings_column_view strings(compactStateView);
   EXPECT_LT(strings.chars_size(stream), static_cast<int64_t>(sums.size()) * 32);
 
-  auto result = deserializeDecimalSumState(compactStateView, 2, stream);
+  auto result = deserializeDecimalSumState(compactStateView, 2, stream, mr);
 
   auto outSum = copyColumnData<__int128_t>(result.sum->view(), stream);
   auto outCount = copyColumnData<int64_t>(result.count->view(), stream);
@@ -2349,6 +2351,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateLeadingNullCompact) {
 
 TEST_F(CudfDecimalTest, decimalDeserializeSumStateAllNull) {
   auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
   constexpr cudf::size_type numRows = 4;
 
   auto offsetsCol = cudf::make_fixed_width_column(
@@ -2375,7 +2378,8 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateAllNull) {
       nullCount,
       std::move(nullMask));
 
-  auto sumAndCount = deserializeDecimalSumState(stateCol->view(), 2, stream);
+  auto sumAndCount =
+      deserializeDecimalSumState(stateCol->view(), 2, stream, mr);
   auto outSumView = sumAndCount.sum->view();
   auto outCountView = sumAndCount.count->view();
 
@@ -2488,7 +2492,8 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripUsesInt64Offsets) {
   cudf::strings_column_view strings(stateCol->view());
   EXPECT_EQ(strings.offsets().type().id(), cudf::type_id::INT64);
 
-  auto sumAndCount = deserializeDecimalSumState(stateCol->view(), 2, stream);
+  auto sumAndCount =
+      deserializeDecimalSumState(stateCol->view(), 2, stream, mr);
   auto outSumView = sumAndCount.sum->view();
   auto outCountView = sumAndCount.count->view();
   auto outSum = copyColumnData<__int128_t>(outSumView, stream);
@@ -2819,7 +2824,8 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripDecimal64) {
       serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
 
-  auto sumAndCount = deserializeDecimalSumState(stateCol->view(), 2, stream);
+  auto sumAndCount =
+      deserializeDecimalSumState(stateCol->view(), 2, stream, mr);
   auto outSumView = sumAndCount.sum->view();
   auto outCountView = sumAndCount.count->view();
   auto outSum = copyColumnData<__int128_t>(outSumView, stream);
@@ -2858,7 +2864,8 @@ TEST_F(CudfDecimalTest, decimalSumStateRoundTripDecimal128) {
       serializeDecimalSumState(sumCol->view(), countCol->view(), stream, mr);
   auto stateMask = copyNullMask(stateCol->view(), stream);
 
-  auto sumAndCount = deserializeDecimalSumState(stateCol->view(), 3, stream);
+  auto sumAndCount =
+      deserializeDecimalSumState(stateCol->view(), 3, stream, mr);
   auto outSumView = sumAndCount.sum->view();
   auto outCountView = sumAndCount.count->view();
   auto outSum = copyColumnData<__int128_t>(outSumView, stream);

@@ -317,15 +317,11 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
     return castResult(std::move(results[outputIndex_].results[0]), stream, mr);
   }
 
-  bool supportsDirectFinalization() const override {
-    return step == core::AggregationNode::Step::kFinal;
-  }
-
   std::unique_ptr<cudf::column> finalize(
       std::unique_ptr<cudf::column> state,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    VELOX_CHECK(supportsDirectFinalization());
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     return castResult(std::move(state), stream, mr);
   }
 
@@ -369,8 +365,8 @@ void addDecimalSumCountRequestsAfterDecode(
     uint32_t& countIdx,
     std::unique_ptr<cudf::column>& decodedSum,
     std::unique_ptr<cudf::column>& decodedCount) {
-  auto sumAndCount =
-      cudf_velox::deserializeDecimalSumState(encodedColumn, scale, stream);
+  auto sumAndCount = cudf_velox::deserializeDecimalSumState(
+      encodedColumn, scale, stream, get_temp_mr());
   decodedSum.swap(sumAndCount.sum);
   decodedCount.swap(sumAndCount.count);
 
@@ -429,7 +425,7 @@ void addDecimalFinalSumOnlyRequest(
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
   auto sumAndCount = cudf_velox::deserializeDecimalSumState(
-      tbl.column(inputIndex), scale, stream);
+      tbl.column(inputIndex), scale, stream, get_temp_mr());
   decodedSum.swap(sumAndCount.sum);
   request.values = decodedSum->view();
   request.aggregations.push_back(
@@ -541,23 +537,19 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
     decodedCount_.reset();
   }
 
-  bool supportsDirectFinalization() const override {
-    return step == core::AggregationNode::Step::kFinal;
-  }
-
   std::unique_ptr<cudf::column> finalize(
       std::unique_ptr<cudf::column> state,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    VELOX_CHECK(supportsDirectFinalization());
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     const auto scale = getDecimalPrecisionScale(*resultType).second;
-    auto decoded =
-        cudf_velox::deserializeDecimalSumState(state->view(), scale, stream);
+    auto decoded = cudf_velox::deserializeDecimalSumState(
+        state->view(), scale, stream, mr);
     const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
     if (decoded.sum->type() != outputType) {
       return cudf::cast(*decoded.sum, outputType, stream, mr);
     }
-    return std::make_unique<cudf::column>(decoded.sum->view(), stream, mr);
+    return std::move(decoded.sum);
   }
 
  private:
@@ -652,18 +644,14 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
     decodedCount_.reset();
   }
 
-  bool supportsDirectFinalization() const override {
-    return step == core::AggregationNode::Step::kFinal;
-  }
-
   std::unique_ptr<cudf::column> finalize(
       std::unique_ptr<cudf::column> state,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    VELOX_CHECK(supportsDirectFinalization());
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     const auto scale = getDecimalPrecisionScale(*resultType).second;
-    auto decoded =
-        cudf_velox::deserializeDecimalSumState(state->view(), scale, stream);
+    auto decoded = cudf_velox::deserializeDecimalSumState(
+        state->view(), scale, stream, get_temp_mr());
     return finalizeDecimalAverage(
         std::move(decoded.sum),
         std::move(decoded.count),
@@ -742,15 +730,11 @@ struct GroupbyCountAggregator : GroupbyAggregator {
         std::move(results[outputIndex_].results[0]), stream, mr);
   }
 
-  bool supportsDirectFinalization() const override {
-    return step == core::AggregationNode::Step::kFinal;
-  }
-
   std::unique_ptr<cudf::column> finalize(
       std::unique_ptr<cudf::column> state,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    VELOX_CHECK(supportsDirectFinalization());
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     return makeCountResult(std::move(state), stream, mr);
   }
 
@@ -931,15 +915,11 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
     }
   }
 
-  bool supportsDirectFinalization() const override {
-    return step == core::AggregationNode::Step::kFinal;
-  }
-
   std::unique_ptr<cudf::column> finalize(
       std::unique_ptr<cudf::column> state,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    VELOX_CHECK(supportsDirectFinalization());
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     VELOX_CHECK(state->type().id() == cudf::type_id::STRUCT);
     auto contents = state->release();
     VELOX_CHECK_EQ(contents.children.size(), 2);
@@ -1087,15 +1067,11 @@ struct GroupbyStddevSampAggregator : GroupbyAggregator {
     }
   }
 
-  bool supportsDirectFinalization() const override {
-    return step == core::AggregationNode::Step::kFinal;
-  }
-
   std::unique_ptr<cudf::column> finalize(
       std::unique_ptr<cudf::column> state,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    VELOX_CHECK(supportsDirectFinalization());
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     return finalizeM2State(std::move(state), stream, mr);
   }
 
@@ -2125,22 +2101,7 @@ RowVectorPtr CudfGroupby::doGetOutput() {
       return nullptr;
     }
     auto& aggs = isSingleStep_ ? finalAggregators_ : aggregators_;
-    if (std::all_of(aggs.begin(), aggs.end(), [](const auto& aggregator) {
-          return aggregator->supportsDirectFinalization();
-        })) {
-      return finalizeGroupedStates(aggs);
-    }
-    auto stream = bufferedResult_->stream();
-    auto result = doGroupByAggregation(
-        bufferedResult_->getTableView(),
-        groupingKeyOutputChannels_,
-        aggs,
-        outputType_,
-        stream,
-        get_output_mr());
-    stream.sync();
-    bufferedResult_.reset();
-    return result;
+    return finalizeGroupedStates(aggs);
   }
 
   if (inputs_.empty() && !noMoreInput_) {
