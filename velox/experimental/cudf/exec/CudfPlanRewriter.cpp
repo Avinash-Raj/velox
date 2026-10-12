@@ -335,15 +335,66 @@ PlanNodePtr rewriteNode(
     return finish(core::FilterNode::Builder(*filter).source(source).build());
   }
 
+  std::vector<PlanNodePtr> sources;
+  bool changed = false;
   for (const auto& source : node->sources()) {
+    auto rewritten = rewriteNode(source, source->outputType());
     VELOX_USER_CHECK(
-        !hasCompactOutput(source) &&
-            rewriteNode(source, source->outputType()) == source,
-        "Unsupported node above compact aggregation: {} ({})",
+        !hasCompactOutput(rewritten),
+        "Unsupported compact aggregation state source: {} ({})",
         node->name(),
         node->id());
+    changed |= rewritten != source;
+    sources.push_back(std::move(rewritten));
   }
-  return finish(node);
+  if (!changed) {
+    return finish(node);
+  }
+
+  // These nodes may surround a completed aggregation, but cannot consume a
+  // changed intermediate schema. Each source was checked against its old type.
+  if (const auto* topN = dynamic_cast<const core::TopNNode*>(node.get())) {
+    return finish(core::TopNNode::Builder(*topN).source(sources[0]).build());
+  }
+  if (const auto* orderBy =
+          dynamic_cast<const core::OrderByNode*>(node.get())) {
+    return finish(
+        core::OrderByNode::Builder(*orderBy).source(sources[0]).build());
+  }
+  if (const auto* limit = dynamic_cast<const core::LimitNode*>(node.get())) {
+    return finish(core::LimitNode::Builder(*limit).source(sources[0]).build());
+  }
+  if (const auto* join = dynamic_cast<const core::HashJoinNode*>(node.get())) {
+    return finish(
+        core::HashJoinNode::Builder(*join)
+            .left(sources[0])
+            .right(sources[1])
+            .build());
+  }
+  if (const auto* join = dynamic_cast<const core::MergeJoinNode*>(node.get())) {
+    return finish(
+        core::MergeJoinNode::Builder(*join)
+            .left(sources[0])
+            .right(sources[1])
+            .build());
+  }
+  if (const auto* join =
+          dynamic_cast<const core::NestedLoopJoinNode*>(node.get())) {
+    return finish(
+        core::NestedLoopJoinNode::Builder(*join)
+            .left(sources[0])
+            .right(sources[1])
+            .build());
+  }
+  if (const auto* merge =
+          dynamic_cast<const core::LocalMergeNode*>(node.get())) {
+    return finish(
+        core::LocalMergeNode::Builder(*merge).sources(sources).build());
+  }
+  VELOX_USER_FAIL(
+      "Unsupported node above compact aggregation: {} ({})",
+      node->name(),
+      node->id());
 }
 
 } // namespace
