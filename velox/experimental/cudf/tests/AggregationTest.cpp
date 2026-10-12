@@ -1107,6 +1107,7 @@ DEBUG_ONLY_TEST_F(
 
   // Observe ownership without keeping the old GPU table alive ourselves.
   std::weak_ptr<cudf_velox::CudfVector> previousResult;
+  std::weak_ptr<cudf_velox::CudfVector> incomingBatch;
   size_t concatenations = 0;
   size_t replacements = 0;
   SCOPED_TESTVALUE_SET(
@@ -1117,11 +1118,19 @@ DEBUG_ONLY_TEST_F(
         ++concatenations;
       }));
   SCOPED_TESTVALUE_SET(
+      "CudfGroupby::computeFinalGroupbyIncrementally::beforeReleaseInput",
+      std::function<void(cudf_velox::CudfVectorPtr*)>([&](auto* input) {
+        ASSERT_NE(*input, nullptr);
+        incomingBatch = *input;
+      }));
+  SCOPED_TESTVALUE_SET(
       "CudfGroupby::computeFinalGroupbyIncrementally::beforeAggregate",
       std::function<void(cudf_velox::CudfVectorPtr*)>([&](auto*) {
         EXPECT_TRUE(previousResult.expired())
             << "Old aggregation result must be released before allocating "
                "the replacement aggregation's working buffers";
+        EXPECT_TRUE(incomingBatch.expired())
+            << "Incoming batch must also be released before regrouping";
         ++replacements;
       }));
 

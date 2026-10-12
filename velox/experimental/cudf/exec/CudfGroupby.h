@@ -117,9 +117,8 @@ struct GroupbyAggregator {
   // Returns the value column for 'valueIdx'. When this aggregate has no mask,
   // returns tbl.column(valueIdx) directly. When it has a mask, materializes the
   // masked column into the owning member maskedValues_ and returns a view into
-  // it -- so the returned view stays valid only until the next call on this
-  // aggregator. doGroupByAggregation fully consumes 'requests' via aggregate()
-  // before the next batch reuses the aggregator, so the view never dangles.
+  // it. doGroupByAggregation enqueues the last use via aggregate() before
+  // releaseInput() frees the owning column on the same stream.
   cudf::column_view materializeMaskedInput(
       cudf::table_view const& tbl,
       uint32_t valueIdx,

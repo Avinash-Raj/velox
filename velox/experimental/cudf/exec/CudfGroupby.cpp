@@ -702,8 +702,8 @@ struct GroupbyCountAggregator : GroupbyAggregator {
  private:
   CountInputKind inputKind_;
   uint32_t outputIndex_;
-  // Transient validity column for masked count(*)/count(const), valid until the
-  // next addGroupbyRequest on this aggregator.
+  // Transient validity column for masked count(*)/count(const), kept alive
+  // until releaseInput().
   std::unique_ptr<cudf::column> maskedCount_;
 };
 
@@ -1761,6 +1761,9 @@ void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
   common::testutil::TestValue::adjust(
       "CudfGroupby::computeFinalGroupbyIncrementally::beforeConcatenate",
       &bufferedResult_);
+  common::testutil::TestValue::adjust(
+      "CudfGroupby::computeFinalGroupbyIncrementally::beforeReleaseInput",
+      &tbl);
   std::vector<cudf::table_view> tablesToConcat;
   tablesToConcat.push_back(bufferedResult_->getTableView());
   tablesToConcat.push_back(permutedInputView);
@@ -1771,16 +1774,14 @@ void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
 
   auto concatenatedTable =
       cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
-  // Release before the re-aggregation so the copied-from state is not part of
-  // the peak. The free is stream-ordered on `finalStream`, the stream the
-  // concatenate ran on, so it cannot race the copy.
+  // TODO: Open a separate upstream PR for early FINAL aggregation input
+  // release. Concatenation has consumed both inputs. Order their deallocation
+  // after it on finalStream, before aggregation allocates its working/output
+  // buffers.
+  VELOX_CHECK(bufferedResult_->rebindStream(finalStream));
+  VELOX_CHECK(tbl->rebindStream(finalStream));
   bufferedResult_.reset();
-  cudf::detail::join_streams(
-      std::vector<cuda::stream_ref>{finalStream}, inputTableStream);
-  // The concatenation owns a replacement for the retained result. Release
-  // the old table before aggregation allocates its working/output buffers.
-  // Its deallocation is ordered after concatenation on finalStream.
-  bufferedResult_.reset();
+  tbl.reset();
   common::testutil::TestValue::adjust(
       "CudfGroupby::computeFinalGroupbyIncrementally::beforeAggregate",
       &bufferedResult_);
@@ -1840,6 +1841,7 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+  input.reset();
 
   if (streamingGroupbyEnabled_) {
     computeFinalGroupbyStreaming(std::move(cudfInput));
@@ -1854,7 +1856,7 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
       computeSingleGroupbyIncrementally(cudfInput);
       return;
     } else {
-      computeFinalGroupbyIncrementally(cudfInput);
+      computeFinalGroupbyIncrementally(std::move(cudfInput));
       return;
     }
   }
