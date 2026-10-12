@@ -637,6 +637,28 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalSingleDecimal64Overflow) {
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
+TEST_F(CudfDecimalTest, decimalAvgGlobalPartialDecimal64Overflow) {
+  constexpr int64_t kBig = 900'000'000'000'000'000;
+  constexpr int kNumRows = 12;
+  std::vector<int64_t> values(kNumRows, kBig);
+
+  auto input =
+      makeRowVector({"d"}, {makeFlatVector<int64_t>(values, DECIMAL(18, 0))});
+
+  auto plan = exec::test::PlanBuilder()
+                  .values({input})
+                  .partialAggregation({}, {"avg(d) AS a"})
+                  .finalAggregation()
+                  .planNode();
+
+  auto expected =
+      makeRowVector({"a"}, {makeFlatVector<int64_t>({kBig}, DECIMAL(18, 0))});
+
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
+  facebook::velox::test::assertEqualVectors(expected, result);
+}
+
 TEST_F(CudfDecimalTest, decimalAvgGroupbySingleDecimal64Overflow) {
   // Same overflow within a single group, exercising the groupby raw sum path.
   constexpr int64_t kBig = 900'000'000'000'000'000;
@@ -1243,6 +1265,36 @@ TEST_F(CudfDecimalTest, decimalSumGroupbySingleDecimal64Overflow) {
   auto result =
       facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
+}
+
+TEST_F(CudfDecimalTest, decimalSumGlobalSingleDecimal64Overflow) {
+  constexpr int64_t kBig = 900'000'000'000'000'000;
+  constexpr int kNumRows = 12;
+  std::vector<int64_t> values(kNumRows, kBig);
+
+  auto input =
+      makeRowVector({"d"}, {makeFlatVector<int64_t>(values, DECIMAL(18, 0))});
+
+  const int128_t expectedSum = static_cast<int128_t>(kBig) * kNumRows;
+  auto plan = exec::test::PlanBuilder()
+                  .values({input})
+                  .singleAggregation({}, {"sum(d) AS s"})
+                  .planNode();
+
+  auto expected = makeRowVector(
+      {"s"}, {makeFlatVector<int128_t>({expectedSum}, DECIMAL(38, 0))});
+
+  auto result =
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
+  facebook::velox::test::assertEqualVectors(expected, result);
+
+  auto compactPlan = exec::test::PlanBuilder()
+                         .values({input})
+                         .partialAggregation({}, {"sum(d) AS s"})
+                         .finalAggregation()
+                         .planNode();
+  exec::test::AssertQueryBuilder(CudfPlanRewriter::rewrite(compactPlan))
+      .assertResults(expected);
 }
 
 TEST_F(CudfDecimalTest, decimalSumGlobalPartialFinalDecimal64Overflow) {
@@ -1859,6 +1911,38 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedBoundariesAndModifiers) {
   VELOX_ASSERT_THROW(
       CudfPlanRewriter::rewrite(projected),
       "Unsupported compact aggregation state source");
+}
+
+TEST_F(CudfDecimalTest, reduceDecimal64SumCountSlicesAndNulls) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  const std::vector<int64_t> values = {999, 100, 999, -100, 999};
+  const std::vector<bool> valid = {false, true, false, true, false};
+  auto input = makeDecimalColumn<int64_t>(values, 2, &valid, stream);
+  auto slices = cudf::slice(input->view(), {1, 4, 2, 3, 0, 0}, stream);
+  const std::vector<int64_t> expectedCounts = {2, 0, 0};
+  for (size_t i = 0; i < slices.size(); ++i) {
+    SCOPED_TRACE(i);
+    auto result = reduceDecimal64SumCount(slices[i], stream, mr);
+    EXPECT_EQ(
+        result.sum->type(), cudf::data_type(cudf::type_id::DECIMAL128, -2));
+    EXPECT_EQ(copyColumnData<int128_t>(result.sum->view(), stream)[0], 0);
+    EXPECT_EQ(
+        copyColumnData<int64_t>(result.count->view(), stream)[0],
+        expectedCounts[i]);
+    EXPECT_EQ(result.sum->null_count(), expectedCounts[i] == 0 ? 1 : 0);
+    EXPECT_EQ(result.count->null_count(), 0);
+  }
+
+  constexpr int64_t kBig = 900'000'000'000'000'000;
+  auto nonNullInput = makeDecimalColumn<int64_t>(
+      std::vector<int64_t>(12, kBig), 2, nullptr, stream);
+  auto result = reduceDecimal64SumCount(nonNullInput->view(), stream, mr);
+  EXPECT_EQ(
+      copyColumnData<int128_t>(result.sum->view(), stream)[0],
+      static_cast<int128_t>(kBig) * 12);
+  EXPECT_EQ(copyColumnData<int64_t>(result.count->view(), stream)[0], 12);
+  EXPECT_EQ(result.sum->null_count(), 0);
 }
 
 TEST_F(CudfDecimalTest, decimalDeserializeSumStateDecimal64) {
