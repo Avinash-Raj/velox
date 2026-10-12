@@ -53,14 +53,14 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf PR #24494: terminal finalization for streaming groupby
+# cudf commit e81bd75: merged terminal streaming groupby finalization (#24494)
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT 0a1a52d8dcb990ffe4af2ac3037777967ae43e08)
+set(VELOX_cudf_COMMIT e81bd7572a46f72efdd8ef99a6bdcdc569e110c2)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  bf50134a4a88b98b399308b19a0a6debe98f86faa0bf5ac083dfc5a3bb6d8a3c
+  eb474b044508247a6d5a05d33f8f3ec284f376d794e710504fc64537da184f0b
 )
-set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+set(VELOX_cudf_SOURCE_URL "https://github.com/NVIDIA/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install. The variables are used only to gate ucxx
