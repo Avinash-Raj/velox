@@ -157,10 +157,12 @@ DecimalSumStateColumns deserializeDecimalSumState(
       alignof(int64_t));
 
   if (stateCol.nullable()) {
-    auto nullMask = cudf::copy_bitmask(stateCol, stream, mr);
+    auto nullMask =
+        cudf::copy_bitmask(stateCol, stream, cudf::memory_resources{mr, mr});
     auto nullCount = stateCol.null_count();
     sumCol->set_null_mask(std::move(nullMask), nullCount);
-    auto countMask = cudf::copy_bitmask(stateCol, stream, mr);
+    auto countMask =
+        cudf::copy_bitmask(stateCol, stream, cudf::memory_resources{mr, mr});
     countCol->set_null_mask(std::move(countMask), nullCount);
   }
 

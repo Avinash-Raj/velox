@@ -2118,7 +2118,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateUncompactedSlice) {
   ASSERT_EQ(slices.size(), 1);
   ASSERT_EQ(slices.front().offset(), 1);
 
-  auto result = deserializeDecimalSumState(slices.front(), 2, stream);
+  auto result = deserializeDecimalSumState(slices.front(), 2, stream, mr);
   auto outSum = copyColumnData<__int128_t>(result.sum->view(), stream);
   auto outCount = copyColumnData<int64_t>(result.count->view(), stream);
   auto outMask = copyNullMask(result.sum->view(), stream);
@@ -2172,7 +2172,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateArrowCompactedSlice) {
   ASSERT_EQ(slices.size(), 1);
   ASSERT_EQ(slices.front().offset(), 1);
 
-  auto result = deserializeDecimalSumState(slices.front(), 2, stream);
+  auto result = deserializeDecimalSumState(slices.front(), 2, stream, mr);
   auto outSum = copyColumnData<__int128_t>(result.sum->view(), stream);
   auto outCount = copyColumnData<int64_t>(result.count->view(), stream);
   auto outMask = copyNullMask(result.sum->view(), stream);
@@ -2414,7 +2414,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsInvalidRowWidth) {
       cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 
   VELOX_ASSERT_THROW(
-      deserializeDecimalSumState(stateCol->view(), 2, stream),
+      deserializeDecimalSumState(stateCol->view(), 2, stream, mr),
       "Decimal sum state requires every non-null row to be 32 bytes");
 }
 
@@ -2451,7 +2451,7 @@ TEST_F(CudfDecimalTest, decimalDeserializeSumStateRejectsMisalignedRow) {
       std::move(nullMask));
 
   VELOX_ASSERT_THROW(
-      deserializeDecimalSumState(stateCol->view(), 2, stream),
+      deserializeDecimalSumState(stateCol->view(), 2, stream, mr),
       "Decimal sum state requires every non-null row to be 32 bytes and 8-byte aligned");
 }
 

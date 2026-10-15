@@ -156,7 +156,7 @@ struct StreamingGroupbyDecimalAggregator final : StreamingGroupbyAggregator {
       cuda::stream_ref stream) override {
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     auto decoded = cudf_velox::deserializeDecimalSumState(
-        input.column(inputIndex), scale, stream);
+        input.column(inputIndex), scale, stream, get_temp_mr());
     decodedSum_ = std::move(decoded.sum);
     preparedInputIndex_ = preparedColumns.size();
     preparedColumns.push_back(decodedSum_->view());
@@ -542,10 +542,15 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
+    const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
+    if (compactDecimalSum_) {
+      return state->type() == outputType
+          ? std::move(state)
+          : cudf::cast(*state, outputType, stream, mr);
+    }
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     auto decoded = cudf_velox::deserializeDecimalSumState(
         state->view(), scale, stream, mr);
-    const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
     if (decoded.sum->type() != outputType) {
       return cudf::cast(*decoded.sum, outputType, stream, mr);
     }
@@ -864,7 +869,10 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
             size,
             rmm::device_buffer{},
             cudf::create_null_mask(
-                0, cudf::mask_state::UNALLOCATED, stream, mr),
+                0,
+                cudf::mask_state::UNALLOCATED,
+                stream,
+                cudf::memory_resources{mr, get_temp_mr()}),
             0,
             std::move(children));
       }
@@ -900,7 +908,10 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
             size,
             rmm::device_buffer{},
             cudf::create_null_mask(
-                0, cudf::mask_state::UNALLOCATED, stream, mr),
+                0,
+                cudf::mask_state::UNALLOCATED,
+                stream,
+                cudf::memory_resources{mr, get_temp_mr()}),
             0,
             std::move(children));
       }
@@ -1148,7 +1159,11 @@ struct GroupbyStddevSampAggregator : GroupbyAggregator {
         cudf::data_type(cudf::type_id::STRUCT),
         size,
         rmm::device_buffer{},
-        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+        cudf::create_null_mask(
+            0,
+            cudf::mask_state::UNALLOCATED,
+            stream,
+            cudf::memory_resources{mr, get_temp_mr()}),
         0,
         std::move(children));
   }
@@ -1658,7 +1673,9 @@ CudfVectorPtr CudfGroupby::finalizeStreamingGroupby() {
   VELOX_CHECK(streamingGroupbyStream_.has_value());
   const auto stream = *streamingGroupbyStream_;
   auto [groupKeys, results] =
-      streamingGroupby_->finalize_and_release(stream, get_output_mr());
+      std::move(*streamingGroupby_)
+          .finalize_and_release(
+              stream, cudf::memory_resources{get_output_mr(), get_temp_mr()});
 
   std::vector<std::unique_ptr<cudf::column>> outputColumns;
   auto keyColumns = groupKeys->release();
