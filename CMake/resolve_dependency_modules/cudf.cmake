@@ -64,16 +64,11 @@ set(VELOX_cudf_SOURCE_URL "https://github.com/NVIDIA/cudf/archive/${VELOX_cudf_C
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install, to pick the default for
-# VELOX_ENABLE_UCX_EXCHANGE below. velox_ucx_exchange runs its own
-# find_package(ucx REQUIRED); this probe only decides the default and fails the
-# configure before cuDF is fetched when the option is on without UCX.
-find_library(UCX_LIBRARY NAMES ucp)
-find_path(UCX_INCLUDE_DIR NAMES ucp/api/ucp.h)
-if(UCX_LIBRARY AND UCX_INCLUDE_DIR)
-  set(UCX_FOUND TRUE)
-else()
-  set(UCX_FOUND FALSE)
-endif()
+# VELOX_ENABLE_UCX_EXCHANGE below. velox_ucx_exchange and ucxx require UCX's
+# CMake package; this probe also fails the configure before cuDF is fetched when
+# the option is on without UCX.
+find_package(ucx QUIET GLOBAL)
+set(UCX_FOUND ${ucx_FOUND})
 
 # Whether to build the experimental UCX GPU exchange transport
 # (velox/experimental/ucx-exchange) and the cuDF-side registration that selects
@@ -92,15 +87,9 @@ option(
 
 if(VELOX_ENABLE_UCX_EXCHANGE)
   if(NOT UCX_FOUND)
-    message(
-      FATAL_ERROR
-      "VELOX_ENABLE_UCX_EXCHANGE=ON but no system UCX was found (need libucp and ucp/api/ucp.h)."
-    )
+    message(FATAL_ERROR "VELOX_ENABLE_UCX_EXCHANGE=ON but no system UCX CMake package was found.")
   endif()
-  message(
-    STATUS
-    "UCX exchange enabled with ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched"
-  )
+  message(STATUS "UCX exchange enabled -- ucxx will be fetched")
   # ucxx commit 7ecd4f5 from 2026-09-29 (main branch)
   set(VELOX_ucxx_VERSION 0.53)
   set(VELOX_ucxx_COMMIT 7ecd4f55ce9a833b3f23c85a574d07db8f98e0b8)

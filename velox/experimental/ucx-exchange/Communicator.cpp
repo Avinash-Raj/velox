@@ -19,11 +19,11 @@
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
 #include <iostream>
+#include "UcxExchangeModules.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
-#include "velox/experimental/ucx-exchange/UcxExchangeModules.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 

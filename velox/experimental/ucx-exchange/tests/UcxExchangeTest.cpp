@@ -1008,10 +1008,10 @@ TEST_F(UcxExchangeFocusedTest, compactDecimalSumAcrossTasks) {
           [](int32_t id,
              DriverCtx* ctx,
              const std::shared_ptr<const PartitionedOutputNode>& node,
-             bool /*eagerFlush*/,
+             bool eagerFlush,
              const std::shared_ptr<UcxOutputQueueManager>& manager) {
             return std::make_unique<UcxPartitionedOutput>(
-                id, ctx, node, manager);
+                id, ctx, node, eagerFlush, manager);
           }));
   queryCtx->setRegistry(OutputTransportRegistry::kRegistryKey, outputs);
   auto exchanges = ExchangeTransportRegistry::create();
