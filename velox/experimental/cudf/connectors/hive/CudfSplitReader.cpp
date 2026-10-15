@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
+#include "velox/experimental/cudf/connectors/hive/CachingDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -536,6 +537,33 @@ bool CudfSplitReader::hasSplitSpecificPushdownFilter() const {
   return hasSplitSpecificPushdownFilter_;
 }
 
+namespace {
+
+std::unique_ptr<cudf::io::datasource> createKvikioDataSource(
+    const CudfHiveConnectorSplit& split,
+    const std::shared_ptr<IoStats>& ioStats) {
+  const auto knownSize = knownKvikioFileSize(split);
+  // Open the whole file (offset 0, no size estimate), not this split's range,
+  // because the reader also reads the footer at the end of the file. With the
+  // file size known, opening sends no HEAD request to S3.
+  auto source = cudf::io::datasource::create(
+      split.filePath, /*offset=*/0, /*max_size_estimate=*/0, knownSize);
+  if (ioStats) {
+    ioStats->addCounter(
+        knownSize.has_value() ? "cudfKvikioKnownSizeOpens"
+                              : "cudfKvikioUnknownSizeOpens",
+        RuntimeCounter(1));
+  }
+  return maybeCacheKvikioDataSource(
+      std::move(source),
+      split.filePath,
+      velox::cache::AsyncDataCache::getInstance(),
+      split.cacheable,
+      ioStats);
+}
+
+} // namespace
+
 void CudfSplitReader::setupCudfDataSource() {
   if (dataSource_ or emptySplit_) {
     return;
@@ -560,9 +588,7 @@ void CudfSplitReader::setupCudfDataSource() {
   // Helper to create a KvikIO data source.
   auto makeKvikioDataSource = [&]() {
     try {
-      dataSource_ = std::move(
-          cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-              .front());
+      dataSource_ = createKvikioDataSource(*split_, ioStats_);
     } catch (const std::system_error& e) {
       // KvikIO preserves errno for local opens only.
       // TODO: Ignore missing remote files once KvikIO reports them
