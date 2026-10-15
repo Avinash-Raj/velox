@@ -1555,6 +1555,64 @@ TEST_F(CudfDecimalTest, compactSumGroupedMixedAggregates) {
   }
 }
 
+TEST_F(CudfDecimalTest, streamingCompactSumThroughLocalExchange) {
+  auto& config = CudfConfig::getInstance();
+  const auto savedEnabled = config.streamingGroupbyEnabled;
+  config.streamingGroupbyEnabled = true;
+  SCOPE_EXIT {
+    config.streamingGroupbyEnabled = savedEnabled;
+  };
+
+  auto input = makeRowVector({
+      makeFlatVector<int32_t>({0, 0, 1, 1, 2, 2}),
+      makeNullableFlatVector<int64_t>(
+          {100,
+           -100,
+           std::nullopt,
+           std::nullopt,
+           999'999'999'999'999'999,
+           std::nullopt},
+          DECIMAL(18, 2)),
+      makeNullableFlatVector<int128_t>(
+          {100, -100, std::nullopt, std::nullopt, 200, std::nullopt},
+          DECIMAL(20, 2)),
+  });
+  auto expected = makeRowVector({
+      makeFlatVector<int32_t>({0, 1, 2}),
+      makeNullableFlatVector<int128_t>(
+          {0, std::nullopt, int128_t{999'999'999'999'999'999} * 3},
+          DECIMAL(38, 2)),
+      makeNullableFlatVector<int128_t>({0, std::nullopt, 600}, DECIMAL(38, 2)),
+      makeNullableFlatVector<int64_t>(
+          {0, std::nullopt, 999'999'999'999'999'999}, DECIMAL(18, 2)),
+  });
+  auto plan = CudfPlanRewriter::rewrite(
+      exec::test::PlanBuilder()
+          .values({input, input, input})
+          .partialAggregation({"c0"}, {"sum(c1)", "sum(c2)", "avg(c1)"})
+          .localPartition({"c0"})
+          .finalAggregation()
+          .planNode());
+  const auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+  ASSERT_NE(final, nullptr);
+  ASSERT_TRUE(final->usesCompactDecimalSum(0));
+  ASSERT_FALSE(final->usesCompactDecimalSum(1));
+  ASSERT_FALSE(final->usesCompactDecimalSum(2));
+  ASSERT_EQ(*plan->sources()[0]->outputType()->childAt(1), *DECIMAL(38, 2));
+
+  auto task = exec::test::AssertQueryBuilder(plan)
+                  .maxDrivers(1)
+                  .config(CudfFromVelox::kGpuBatchSizeRows, 6)
+                  .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .assertResults(expected);
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      stats.at(plan->id())
+          .customStats.at(std::string{kStreamingGroupbyUsedStat})
+          .sum,
+      0);
+}
+
 TEST_F(CudfDecimalTest, compactSumGlobalNullZeroAndEmpty) {
   const std::vector<std::vector<std::optional<int64_t>>> cases = {
       {100, -100, std::nullopt},

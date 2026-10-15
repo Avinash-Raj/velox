@@ -439,6 +439,8 @@ void addDecimalRawPartialSingleSumRequest(
     cuda::stream_ref stream,
     uint32_t& sumIdx,
     std::unique_ptr<cudf::column>& castedInput) {
+  // TODO: Avoid materializing DECIMAL128 input for partial Decimal64 SUM by
+  // widening values on the fly while accumulating, as global reduction does.
   auto inputView = castDecimal64InputToDecimal128(input, castedInput, stream);
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
@@ -1243,6 +1245,10 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
          !cudf::groupby::is_streaming_groupby_supported(
              cudf::data_type{cudf::type_id::INT64}, cudf::aggregation::SUM))) {
       return nullptr;
+    }
+    if (aggregate.compactDecimalSum) {
+      return std::make_unique<StreamingGroupbySumAggregator>(
+          inputIndex, resultType);
     }
     return std::make_unique<StreamingGroupbyDecimalAggregator>(
         inputIndex, resultType, average);
