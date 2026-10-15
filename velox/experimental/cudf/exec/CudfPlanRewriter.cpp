@@ -86,7 +86,8 @@ bool hasCompactOutput(const PlanNodePtr& node) {
     return aggregation->step() == AggregationNode::Step::kPartial ||
         aggregation->step() == AggregationNode::Step::kIntermediate;
   }
-  if (dynamic_cast<const core::LocalPartitionNode*>(node.get())) {
+  if (dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
+      dynamic_cast<const core::ProjectNode*>(node.get())) {
     for (const auto& source : node->sources()) {
       if (hasCompactOutput(source)) {
         return true;
@@ -106,7 +107,8 @@ PlanNodePtr rewriteNode(
     VELOX_USER_CHECK(
         dynamic_cast<const AggregationNode*>(node.get()) ||
             dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
-            dynamic_cast<const core::ExchangeNode*>(node.get()),
+            dynamic_cast<const core::ExchangeNode*>(node.get()) ||
+            dynamic_cast<const core::ProjectNode*>(node.get()),
         "Unsupported compact aggregation state source: {} ({})",
         node->name(),
         node->id());
@@ -242,6 +244,41 @@ PlanNodePtr rewriteNode(
       return node;
     }
     return core::ExchangeNode::Builder(*exchange).outputType(expected).build();
+  }
+
+  if (const auto* project = dynamic_cast<const core::ProjectNode*>(node.get());
+      project && compactInput) {
+    VELOX_USER_CHECK_EQ(project->projections().size(), expected->size());
+    auto sourceType = project->sources()[0]->outputType();
+    auto sourceTypes = sourceType->children();
+    std::vector<core::TypedExprPtr> projections;
+    projections.reserve(project->projections().size());
+    for (size_t i = 0; i < project->projections().size(); ++i) {
+      const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
+          project->projections()[i].get());
+      VELOX_USER_CHECK(
+          field && field->isInputColumn(),
+          "Compact aggregation state project must contain only field references");
+      const auto channel = sourceType->getChildIdx(field->name());
+      VELOX_USER_CHECK(
+          *sourceTypes[channel] == *sourceType->childAt(channel) ||
+              *sourceTypes[channel] == *expected->childAt(i),
+          "Conflicting compact state requirements for {}",
+          field->name());
+      sourceTypes[channel] = expected->childAt(i);
+      projections.push_back(
+          std::make_shared<core::FieldAccessTypedExpr>(
+              expected->childAt(i), field->name()));
+    }
+    auto source = rewriteNode(
+        project->sources()[0],
+        ROW(sourceType->names(), std::move(sourceTypes)),
+        true);
+    return finish(
+        core::ProjectNode::Builder(*project)
+            .projections(std::move(projections))
+            .source(source)
+            .build());
   }
 
   if (const auto* local =

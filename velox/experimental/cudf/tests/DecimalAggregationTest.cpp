@@ -1867,6 +1867,42 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
   EXPECT_EQ(copy->serialize(), gpuConsumer->serialize());
 }
 
+TEST_F(CudfDecimalTest, compactSumThroughLocalExchangeProject) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2))});
+  auto partial = exec::test::PlanBuilder()
+                     .values({input})
+                     .partialAggregation({"k"}, {"sum(d) AS s"})
+                     .planNode();
+  auto plan = exec::test::PlanBuilder()
+                  .exchange(
+                      partial->outputType(),
+                      "Presto",
+                      std::string{core::TransportKind::kUcx})
+                  .project({"s AS state", "k AS key"})
+                  .localPartition({"key"})
+                  .finalAggregation(
+                      {"key"}, {"sum(state) AS total"}, {{DECIMAL(12, 2)}})
+                  .planNode();
+
+  auto rewritten = CudfPlanRewriter::rewrite(plan);
+  auto* partition = dynamic_cast<const core::LocalPartitionNode*>(
+      rewritten->sources()[0].get());
+  ASSERT_NE(partition, nullptr);
+  auto* project =
+      dynamic_cast<const core::ProjectNode*>(partition->sources()[0].get());
+  ASSERT_NE(project, nullptr);
+  auto* exchange =
+      dynamic_cast<const core::ExchangeNode*>(project->sources()[0].get());
+  ASSERT_NE(exchange, nullptr);
+  EXPECT_EQ(*exchange->outputType()->childAt(1), *DECIMAL(38, 2));
+  EXPECT_EQ(*project->outputType()->childAt(0), *DECIMAL(38, 2));
+  EXPECT_EQ(*partition->outputType()->childAt(0), *DECIMAL(38, 2));
+  EXPECT_EQ(*rewritten->outputType(), *plan->outputType());
+}
+
 TEST_F(CudfDecimalTest, compactSumRejectsGpuDisabledWithCpuFallback) {
   enableCpuFallback();
   auto input =
@@ -1944,12 +1980,12 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedBoundariesAndModifiers) {
       "Compact Decimal64 SUM does not support DISTINCT, ordering or masks");
   auto projected =
       exec::test::PlanBuilder(partial, ids)
-          .project({"s"})
+          .project({"s", "k + 1 AS computed"})
           .finalAggregation({}, {"sum(s) AS s"}, {{DECIMAL(12, 2)}})
           .planNode();
   VELOX_ASSERT_THROW(
       CudfPlanRewriter::rewrite(projected),
-      "Unsupported compact aggregation state source");
+      "Compact aggregation state project must contain only field references");
 }
 
 TEST_F(CudfDecimalTest, reduceDecimal64SumCountSlicesAndNulls) {
