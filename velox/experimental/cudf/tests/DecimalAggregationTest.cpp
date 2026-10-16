@@ -2038,7 +2038,7 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedBoundariesAndModifiers) {
       "Compact Decimal64 SUM does not support DISTINCT, ordering or masks");
   auto projected =
       exec::test::PlanBuilder(partial, ids)
-          .project({"s", "k + 1 AS computed"})
+          .project({"s", "1 AS computed"})
           .finalAggregation({}, {"sum(s) AS s"}, {{DECIMAL(12, 2)}})
           .planNode();
   VELOX_ASSERT_THROW(
