@@ -53,14 +53,14 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit e81bd75: merged terminal streaming groupby finalization (#24494)
+# Slot-table streaming groupby with lookup-only aggregation for segmented state.
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT e81bd7572a46f72efdd8ef99a6bdcdc569e110c2)
+set(VELOX_cudf_COMMIT c47fd06c1211dec3591ba50c1520f1f19c465b59)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  eb474b044508247a6d5a05d33f8f3ec284f376d794e710504fc64537da184f0b
+  032337d950b172f94d4653b1a4277ae7ca49eccc62345632303ce66856974c91
 )
-set(VELOX_cudf_SOURCE_URL "https://github.com/NVIDIA/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+set(VELOX_cudf_SOURCE_URL "https://github.com/shrshi/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install, to pick the default for

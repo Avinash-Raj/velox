@@ -34,6 +34,7 @@
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -144,11 +145,12 @@ class PinnedBuffer {
     }
     if (size_ < bytes) {
       if (data_ != nullptr) {
-        allocator_.deallocate_sync(data_, size_);
+        allocator_.deallocate_sync(data_, size_, alignof(std::max_align_t));
         data_ = nullptr;
         size_ = 0;
       }
-      data_ = static_cast<uint8_t*>(allocator_.allocate_sync(bytes));
+      data_ = static_cast<uint8_t*>(
+          allocator_.allocate_sync(bytes, alignof(std::max_align_t)));
       size_ = bytes;
     }
     return data_;
