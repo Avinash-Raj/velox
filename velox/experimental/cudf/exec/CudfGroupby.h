@@ -30,8 +30,8 @@ class CudaEvent;
 
 inline constexpr std::string_view kStreamingGroupbyUsedStat{
     "streamingGroupbyUsed"};
-inline constexpr std::string_view kStreamingGroupbyRebuildsStat{
-    "streamingGroupbyRebuilds"};
+inline constexpr std::string_view kStreamingGroupbySegmentsStat{
+    "streamingGroupbySegments"};
 inline constexpr std::string_view kDirectGroupbyFinalizationStat{
     "directGroupbyFinalization"};
 
@@ -39,7 +39,7 @@ inline constexpr std::string_view kDirectGroupbyFinalizationStat{
 // flattened streaming_groupby request/result interface. prepareInput() must be
 // called before addStreamingRequest(). The prepared input and result indices
 // assigned by these methods must remain stable when requests are recreated for
-// a capacity rebuild.
+// each new segment.
 struct StreamingGroupbyAggregator {
   // Index in the unpermuted operator input and the final Velox result type.
   column_index_t inputIndex;
@@ -265,7 +265,9 @@ class CudfGroupby : public CudfOperatorBase {
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;
-  std::unique_ptr<cudf::groupby::streaming_groupby> streamingGroupby_;
+  // Keys belong to exactly one segment. Only the last accepts new keys.
+  std::vector<std::unique_ptr<cudf::groupby::streaming_groupby>>
+      streamingGroupbys_;
   std::optional<cuda::stream_ref> streamingGroupbyStream_;
   std::unique_ptr<CudaEvent> streamingGroupbyEvent_;
   size_t streamingGroupbyCapacity_{0};

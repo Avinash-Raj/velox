@@ -851,7 +851,7 @@ TEST_F(CudfDecimalTest, decimalAvgIntermediateVarbinaryNullGroup) {
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
-TEST_F(CudfDecimalTest, streamingDecimalSumAndAvg) {
+TEST_F(CudfDecimalTest, streamingDecimalSumAndAvgReusesSegment) {
   auto& config = CudfConfig::getInstance();
   const auto savedEnabled = config.streamingGroupbyEnabled;
   const auto savedMultiplier = config.streamingGroupbyCapacityMultiplier;
@@ -904,8 +904,8 @@ TEST_F(CudfDecimalTest, streamingDecimalSumAndAvg) {
     const auto stats = exec::toPlanStats(task->taskStats());
     const auto& customStats = stats.at(plan->id()).customStats;
     EXPECT_GT(customStats.at(std::string{kStreamingGroupbyUsedStat}).sum, 0);
-    EXPECT_GT(
-        customStats.at(std::string{kStreamingGroupbyRebuildsStat}).sum, 0);
+    EXPECT_EQ(
+        customStats.at(std::string{kStreamingGroupbySegmentsStat}).sum, 1);
   }
 }
 

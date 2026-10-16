@@ -1295,13 +1295,13 @@ TEST_F(
       task, finalAggId, cudf_velox::kStreamingGroupbyUsedStat));
   EXPECT_EQ(
       streamingGroupbyStatSum(
-          task, finalAggId, cudf_velox::kStreamingGroupbyRebuildsStat),
-      0);
+          task, finalAggId, cudf_velox::kStreamingGroupbySegmentsStat),
+      1);
 }
 
 TEST_F(
     StreamingGroupbyAggregationTest,
-    growsBeforeInsertingAnotherHighCardinalityBatch) {
+    addsSegmentsBeforeInsertingHighCardinalityBatches) {
   constexpr int32_t kBatchRows = 8;
   constexpr int32_t kNumBatches = 8;
   auto vectors = makeHighCardinalityBatches(kBatchRows, kNumBatches);
@@ -1325,13 +1325,13 @@ TEST_F(
       task, finalAggId, cudf_velox::kStreamingGroupbyUsedStat));
   EXPECT_GT(
       streamingGroupbyStatSum(
-          task, finalAggId, cudf_velox::kStreamingGroupbyRebuildsStat),
-      0);
+          task, finalAggId, cudf_velox::kStreamingGroupbySegmentsStat),
+      1);
 }
 
 TEST_F(
     StreamingGroupbyAggregationTest,
-    configuredCapacityMultiplierAvoidsRebuilds) {
+    configuredCapacityMultiplierAvoidsAdditionalSegments) {
   constexpr int32_t kBatchRows = 8;
   constexpr int32_t kNumBatches = 8;
   auto vectors = makeHighCardinalityBatches(kBatchRows, kNumBatches);
@@ -1357,13 +1357,13 @@ TEST_F(
       task, finalAggId, cudf_velox::kStreamingGroupbyUsedStat));
   EXPECT_EQ(
       streamingGroupbyStatSum(
-          task, finalAggId, cudf_velox::kStreamingGroupbyRebuildsStat),
-      0);
+          task, finalAggId, cudf_velox::kStreamingGroupbySegmentsStat),
+      1);
 }
 
 TEST_F(
     StreamingGroupbyAggregationTest,
-    configuredCapacityMultiplierControlsGrowth) {
+    configuredCapacityMultiplierControlsSegmentCount) {
   constexpr int32_t kBatchRows = 8;
   constexpr int32_t kNumBatches = 5;
   auto vectors = makeHighCardinalityBatches(kBatchRows, kNumBatches);
@@ -1389,8 +1389,58 @@ TEST_F(
       task, finalAggId, cudf_velox::kStreamingGroupbyUsedStat));
   EXPECT_EQ(
       streamingGroupbyStatSum(
-          task, finalAggId, cudf_velox::kStreamingGroupbyRebuildsStat),
-      1);
+          task, finalAggId, cudf_velox::kStreamingGroupbySegmentsStat),
+      2);
+}
+
+TEST_F(StreamingGroupbyAggregationTest, repeatedKeysUpdateOwningSegments) {
+  constexpr int32_t kBatchRows = 8;
+  cudf_velox::CudfConfig::getInstance().streamingGroupbyCapacityMultiplier =
+      1.1;
+  for (bool addNewKeys : {false, true}) {
+    SCOPED_TRACE(addNewKeys);
+    auto vectors = makeHighCardinalityBatches(kBatchRows, addNewKeys ? 3 : 1);
+    for (int32_t batch = 0; batch < 3; ++batch) {
+      if (addNewKeys) {
+        // Revisit keys from each earlier segment alongside a new key and a
+        // repeated null key. Null values must not contribute to count or avg.
+        vectors.push_back(makeRowVector({
+            makeNullableFlatVector<int64_t>(
+                {0, 8, 16, 24 + batch, std::nullopt, 0, 8, 16}),
+            makeNullableFlatVector<int64_t>(
+                {10, std::nullopt, 30, 40, 50, -5, 20, std::nullopt}),
+        }));
+      } else {
+        vectors.push_back(vectors.front());
+      }
+    }
+    createDuckDbTable(vectors);
+
+    core::PlanNodeId finalAggId;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .maxDrivers(1)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, kBatchRows)
+            .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+            .plan(
+                PlanBuilder()
+                    .values(vectors)
+                    .partialAggregation(
+                        {"c0"}, {"sum(c1)", "count(c1)", "avg(c1)"})
+                    .finalAggregation()
+                    .capturePlanNodeId(finalAggId)
+                    .planNode())
+            .assertResults(
+                "SELECT c0, sum(c1), count(c1), avg(c1) FROM tmp GROUP BY c0");
+
+    const auto segments = streamingGroupbyStatSum(
+        task, finalAggId, cudf_velox::kStreamingGroupbySegmentsStat);
+    if (addNewKeys) {
+      EXPECT_GT(segments, 1);
+    } else {
+      EXPECT_EQ(segments, 1);
+    }
+  }
 }
 
 TEST_F(

@@ -177,8 +177,8 @@ struct CudfConfig {
   /// aggregation combinations supported by the regular cuDF groupby path.
   bool streamingGroupbyEnabled{false};
 
-  /// Multiplier used to derive streaming_groupby's initial logical capacity
-  /// from the first batch and to grow capacity when it is exhausted.
+  /// Headroom multiplier for each streaming_groupby segment's logical capacity,
+  /// derived from its first batch. Existing segments are never rebuilt.
   double streamingGroupbyCapacityMultiplier{2.0};
 
   /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
