@@ -64,6 +64,8 @@ CudaEvent& eventForThread() {
   return *events[deviceIndex];
 }
 
+} // namespace
+
 size_t maxBatchRows() {
   const auto& cudfConfig = CudfConfig::getInstance();
   if (cudfConfig.batchSizeMaxThreshold) {
@@ -83,7 +85,6 @@ vector_size_t checkedVectorSize(size_t rowCount) {
       "cuDF vector row count exceeds Velox vector size limit");
   return static_cast<vector_size_t>(rowCount);
 }
-} // namespace
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,

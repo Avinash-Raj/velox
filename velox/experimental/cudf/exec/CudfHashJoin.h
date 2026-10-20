@@ -33,9 +33,12 @@
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <cuda/stream>
 
 #include <memory>
+#include <queue>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -293,6 +296,26 @@ class CudfHashJoinProbe : public CudfOperatorBase {
     std::unique_ptr<cudf::table> table;
     vector_size_t numRows;
   };
+
+  struct PendingIndices {
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices;
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices;
+    size_t offset{0};
+    size_t buildChunkIndex;
+
+    size_t remaining() const {
+      return leftIndices->size() - offset;
+    }
+  };
+
+  std::queue<PendingIndices> pendingIndices_;
+
+  void enqueuePendingIndices(
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices,
+      size_t buildChunkIndex);
+
+  RowVectorPtr gatherPendingBatch(cuda::stream_ref stream);
 
   /**
    * @brief Performs inner join between probe table and all build tables.

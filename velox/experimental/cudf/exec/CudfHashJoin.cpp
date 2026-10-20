@@ -576,7 +576,8 @@ bool CudfHashJoinProbe::needsInput() const {
   if (joinNode_->isRightSemiFilterJoin()) {
     return !noMoreInput_;
   }
-  return !noMoreInput_ && !finished_ && input_ == nullptr;
+  return !noMoreInput_ && !finished_ && input_ == nullptr &&
+      pendingIndices_.empty();
 }
 
 void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
@@ -860,6 +861,64 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::filteredOutputIndices(
       stream);
 }
 
+void CudfHashJoinProbe::enqueuePendingIndices(
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices,
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices,
+    size_t buildChunkIndex) {
+  pendingIndices_.push(
+      {std::move(leftIndices), std::move(rightIndices), 0, buildChunkIndex});
+}
+
+RowVectorPtr CudfHashJoinProbe::gatherPendingBatch(cuda::stream_ref stream) {
+  VELOX_CHECK(!pendingIndices_.empty());
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+  VELOX_CHECK_NOT_NULL(cudfInput);
+
+  auto& rightTables = hashObject_.value().first;
+  auto leftTableView = cudfInput->getTableView();
+  const auto maxRows = maxBatchRows();
+  size_t rows = 0;
+  std::vector<std::unique_ptr<cudf::table>> tables;
+
+  while (!pendingIndices_.empty() && rows < maxRows) {
+    auto& entry = pendingIndices_.front();
+    const auto chunkSize = std::min(maxRows - rows, entry.remaining());
+    auto leftIndicesCol =
+        cudf::column_view{cudf::device_span<const cudf::size_type>{
+            entry.leftIndices->data() + entry.offset, chunkSize}};
+    auto rightIndicesCol =
+        cudf::column_view{cudf::device_span<const cudf::size_type>{
+            entry.rightIndices->data() + entry.offset, chunkSize}};
+    auto output = unfilteredOutput(
+        leftTableView,
+        leftIndicesCol,
+        rightTables[entry.buildChunkIndex]->view(),
+        rightIndicesCol,
+        stream);
+    tables.push_back(std::move(output.table));
+    rows += chunkSize;
+    entry.offset += chunkSize;
+    if (entry.remaining() == 0) {
+      pendingIndices_.pop();
+    }
+  }
+
+  if (pendingIndices_.empty()) {
+    cudfInput.reset();
+    input_.reset();
+    finished_ =
+        noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
+  }
+  if (rows == 0) {
+    return nullptr;
+  }
+  auto output = tables.size() == 1
+      ? std::move(tables.front())
+      : concatenateTables(std::move(tables), stream, get_output_mr());
+  return std::make_shared<CudfVector>(
+      pool(), outputType_, checkedVectorSize(rows), std::move(output), stream);
+}
+
 std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
     cudf::table_view leftTableView,
     cuda::stream_ref stream) {
@@ -902,6 +961,12 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
         stream,
         get_temp_mr());
 
+    if (!joinNode_->filter()) {
+      enqueuePendingIndices(
+          std::move(leftJoinIndices), std::move(rightJoinIndices), i);
+      continue;
+    }
+
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
     auto rightIndicesSpan =
@@ -940,13 +1005,6 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
             filterFunc,
             stream));
       }
-    } else {
-      cudfOutputs.push_back(unfilteredOutput(
-          leftTableView,
-          leftIndicesCol,
-          rightTableView,
-          rightIndicesCol,
-          stream));
     }
   }
   return cudfOutputs;
@@ -2103,6 +2161,17 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
 }
 
 RowVectorPtr CudfHashJoinProbe::doGetOutput() {
+  if (!pendingIndices_.empty()) {
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+    VELOX_CHECK_NOT_NULL(cudfInput);
+    auto stream = cudfInput->stream();
+    registerReadStream(stream);
+    SCOPE_EXIT {
+      recordReadCompletion(stream);
+    };
+    return gatherPendingBatch(stream);
+  }
+
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
   }
@@ -2245,6 +2314,10 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   // Record probe stream for cross-driver synchronization in noMoreInput().
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
     lastProbeStream_ = stream;
+  }
+
+  if (!pendingIndices_.empty()) {
+    return gatherPendingBatch(stream);
   }
 
   // Release input CudfVector to free GPU memory before creating output.

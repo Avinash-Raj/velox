@@ -27,6 +27,12 @@
 
 namespace facebook::velox::cudf_velox {
 
+/// Maximum number of rows allowed in a cuDF output batch.
+size_t maxBatchRows();
+
+/// Converts a row count to Velox's vector size type with bounds checking.
+vector_size_t checkedVectorSize(size_t rowCount);
+
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
