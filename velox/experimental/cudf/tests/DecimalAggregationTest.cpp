@@ -28,11 +28,13 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/DecimalUtil.h"
 
@@ -234,6 +236,7 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     parse::registerTypeResolver();
     functions::prestosql::registerAllScalarFunctions();
     aggregate::prestosql::registerAllAggregateFunctions();
+    window::prestosql::registerAllWindowFunctions();
     CudfConfig::getInstance().allowCpuFallback = false;
     // Ensure a CUDA device is selected and initialized (RMM asserts otherwise).
     int deviceCount = 0;
@@ -1959,6 +1962,122 @@ TEST_F(CudfDecimalTest, compactSumThroughLocalExchangeProject) {
   EXPECT_EQ(*project->outputType()->childAt(0), *DECIMAL(38, 2));
   EXPECT_EQ(*partition->outputType()->childAt(0), *DECIMAL(38, 2));
   EXPECT_EQ(*rewritten->outputType(), *plan->outputType());
+}
+
+TEST_F(CudfDecimalTest, compactSumThroughRoundRobinPartition) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2}),
+       makeFlatVector<int64_t>({100, 200, 300, 400}, DECIMAL(12, 2))});
+  auto plan =
+      exec::test::PlanBuilder()
+          .values({input})
+          .partialAggregation({"k"}, {"sum(d) AS s"})
+          .localPartitionRoundRobin()
+          .finalAggregation({"k"}, {"sum(s) AS total"}, {{DECIMAL(12, 2)}})
+          .planNode();
+
+  auto rewritten = CudfPlanRewriter::rewrite(plan);
+  auto* partition = dynamic_cast<const core::LocalPartitionNode*>(
+      rewritten->sources()[0].get());
+  ASSERT_NE(partition, nullptr);
+  EXPECT_NE(
+      dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(
+          &partition->partitionFunctionSpec()),
+      nullptr);
+  EXPECT_EQ(*partition->outputType()->findChild("s"), *DECIMAL(38, 2));
+  EXPECT_EQ(*rewritten->outputType(), *plan->outputType());
+  exec::test::AssertQueryBuilder(rewritten).maxDrivers(1).assertResults(
+      makeRowVector(
+          {"k", "total"},
+          {makeFlatVector<int32_t>({1, 2}),
+           makeFlatVector<int128_t>({300, 700}, DECIMAL(38, 2))}));
+}
+
+TEST_F(CudfDecimalTest, compactSumThroughEnforceSingleRow) {
+  auto input = makeRowVector(
+      {"d"}, {makeFlatVector<int64_t>({100, 200, 300}, DECIMAL(12, 2))});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto partial = exec::test::PlanBuilder(ids)
+                     .values({input})
+                     .partialAggregation({}, {"sum(d) AS s"})
+                     .planNode();
+  auto plan = exec::test::PlanBuilder(partial, ids)
+                  .enforceSingleRow()
+                  .finalAggregation({}, {"sum(s) AS total"}, {{DECIMAL(12, 2)}})
+                  .planNode();
+
+  auto rewritten = CudfPlanRewriter::rewrite(plan);
+  auto* singleRow = dynamic_cast<const core::EnforceSingleRowNode*>(
+      rewritten->sources()[0].get());
+  ASSERT_NE(singleRow, nullptr);
+  EXPECT_EQ(*singleRow->outputType()->findChild("s"), *DECIMAL(38, 2));
+  exec::test::AssertQueryBuilder(rewritten).maxDrivers(1).assertResults(
+      makeRowVector(
+          {"total"},
+          {makeFlatVector<int128_t>({600}, DECIMAL(38, 2))}));
+}
+
+TEST_F(CudfDecimalTest, compactSumThroughWindow) {
+  auto input = makeRowVector(
+      {"k", "o", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2}),
+       makeFlatVector<int32_t>({1, 2, 1}),
+       makeFlatVector<int64_t>({100, 200, 400}, DECIMAL(12, 2))});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto partial = exec::test::PlanBuilder(ids)
+                     .values({input})
+                     .partialAggregation({"k", "o"}, {"sum(d) AS s"})
+                     .planNode();
+  auto plan =
+      exec::test::PlanBuilder(partial, ids)
+          .window({"row_number() over (partition by k order by o) AS rn"})
+          .finalAggregation({"k"}, {"sum(s) AS total"}, {{DECIMAL(12, 2)}})
+          .planNode();
+
+  auto rewritten = CudfPlanRewriter::rewrite(plan);
+  auto* window =
+      dynamic_cast<const core::WindowNode*>(rewritten->sources()[0].get());
+  ASSERT_NE(window, nullptr);
+  EXPECT_EQ(*window->inputType()->findChild("s"), *DECIMAL(38, 2));
+  EXPECT_EQ(*window->outputType()->findChild("s"), *DECIMAL(38, 2));
+  exec::test::AssertQueryBuilder(rewritten).maxDrivers(1).assertResults(
+      makeRowVector(
+          {"k", "total"},
+          {makeFlatVector<int32_t>({1, 2}),
+           makeFlatVector<int128_t>({300, 400}, DECIMAL(38, 2))}));
+}
+
+TEST_F(CudfDecimalTest, compactSumThroughGroupId) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2}),
+       makeFlatVector<int64_t>({100, 200, 300, 400}, DECIMAL(12, 2))});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto partial = exec::test::PlanBuilder(ids)
+                     .values({input})
+                     .partialAggregation({"k"}, {"sum(d) AS s"})
+                     .planNode();
+  auto plan =
+      exec::test::PlanBuilder(partial, ids)
+          .groupId({"k"}, {{"k"}, {}}, {"s"})
+          .finalAggregation(
+              {"k", "group_id"}, {"sum(s) AS total"}, {{DECIMAL(12, 2)}})
+          .planNode();
+
+  auto rewritten = CudfPlanRewriter::rewrite(plan);
+  auto* groupId =
+      dynamic_cast<const core::GroupIdNode*>(rewritten->sources()[0].get());
+  ASSERT_NE(groupId, nullptr);
+  EXPECT_EQ(*groupId->aggregationInputs()[0]->type(), *DECIMAL(38, 2));
+  EXPECT_EQ(
+      *groupId->sources()[0]->outputType()->findChild("s"), *DECIMAL(38, 2));
+  exec::test::AssertQueryBuilder(rewritten).maxDrivers(1).assertResults(
+      makeRowVector(
+          {"k", "group_id", "total"},
+          {makeNullableFlatVector<int32_t>({1, 2, std::nullopt}),
+           makeFlatVector<int64_t>({0, 0, 1}),
+           makeFlatVector<int128_t>({300, 700, 1'000}, DECIMAL(38, 2))}));
 }
 
 TEST_F(CudfDecimalTest, compactSumRejectsGpuDisabledWithCpuFallback) {

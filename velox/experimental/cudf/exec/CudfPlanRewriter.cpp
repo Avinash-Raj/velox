@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/exec/CudfPlanRewriter.h"
 
 #include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -45,9 +46,12 @@ core::PartitionFunctionSpecPtr rebindPartition(
   if (dynamic_cast<const core::GatherPartitionFunctionSpec*>(&spec)) {
     return std::make_shared<core::GatherPartitionFunctionSpec>();
   }
+  if (dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(&spec)) {
+    return std::make_shared<exec::RoundRobinPartitionFunctionSpec>();
+  }
   VELOX_USER_CHECK(
       dynamic_cast<const exec::HashPartitionFunctionSpec*>(&spec),
-      "Compact aggregation requires hash or gather partitioning");
+      "Compact aggregation requires hash, gather, or round-robin partitioning");
   auto serialized = spec.serialize();
   VELOX_USER_CHECK(
       serialized["constants"].empty(),
@@ -87,7 +91,10 @@ bool hasCompactOutput(const PlanNodePtr& node) {
         aggregation->step() == AggregationNode::Step::kIntermediate;
   }
   if (dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
-      dynamic_cast<const core::ProjectNode*>(node.get())) {
+      dynamic_cast<const core::ProjectNode*>(node.get()) ||
+      dynamic_cast<const core::GroupIdNode*>(node.get()) ||
+      dynamic_cast<const core::WindowNode*>(node.get()) ||
+      dynamic_cast<const core::EnforceSingleRowNode*>(node.get())) {
     for (const auto& source : node->sources()) {
       if (hasCompactOutput(source)) {
         return true;
@@ -108,7 +115,10 @@ PlanNodePtr rewriteNode(
         dynamic_cast<const AggregationNode*>(node.get()) ||
             dynamic_cast<const core::LocalPartitionNode*>(node.get()) ||
             dynamic_cast<const core::ExchangeNode*>(node.get()) ||
-            dynamic_cast<const core::ProjectNode*>(node.get()),
+            dynamic_cast<const core::ProjectNode*>(node.get()) ||
+            dynamic_cast<const core::GroupIdNode*>(node.get()) ||
+            dynamic_cast<const core::WindowNode*>(node.get()) ||
+            dynamic_cast<const core::EnforceSingleRowNode*>(node.get()),
         "Unsupported compact aggregation state source: {} ({})",
         node->name(),
         node->id());
@@ -279,6 +289,130 @@ PlanNodePtr rewriteNode(
             .projections(std::move(projections))
             .source(source)
             .build());
+  }
+
+  if (const auto* groupId =
+          dynamic_cast<const core::GroupIdNode*>(node.get())) {
+    auto sourceType = groupId->sources()[0]->outputType();
+    auto sourceTypes = sourceType->children();
+    if (compactInput) {
+      VELOX_USER_CHECK_NOT_NULL(expected);
+      VELOX_USER_CHECK_EQ(expected->size(), groupId->outputType()->size());
+      for (size_t i = 0; i < groupId->groupingKeyInfos().size(); ++i) {
+        const auto& key = groupId->groupingKeyInfos()[i];
+        VELOX_USER_CHECK(
+            *expected->childAt(i) == *key.input->type(),
+            "Compact aggregation state cannot be a GroupId grouping key: {}",
+            key.input->name());
+      }
+      const auto aggregationOffset = groupId->groupingKeyInfos().size();
+      for (size_t i = 0; i < groupId->aggregationInputs().size(); ++i) {
+        const auto& input = groupId->aggregationInputs()[i];
+        const auto channel = sourceType->getChildIdx(input->name());
+        const auto& requiredType = expected->childAt(aggregationOffset + i);
+        VELOX_USER_CHECK(
+            *input->type() == *sourceType->childAt(channel),
+            "GroupId aggregation input does not match its source: {}",
+            input->name());
+        VELOX_USER_CHECK(
+            *sourceTypes[channel] == *sourceType->childAt(channel) ||
+                *sourceTypes[channel] == *requiredType,
+            "Conflicting compact state requirements for {}",
+            input->name());
+        sourceTypes[channel] = requiredType;
+      }
+      VELOX_USER_CHECK(
+          *expected->childAt(expected->size() - 1) == *BIGINT(),
+          "Compact state cannot change the GroupId column type");
+    }
+    auto source = rewriteNode(
+        groupId->sources()[0],
+        ROW(sourceType->names(), std::move(sourceTypes)),
+        compactInput);
+    if (source == groupId->sources()[0]) {
+      return finish(node);
+    }
+
+    std::vector<core::GroupIdNode::GroupingKeyInfo> groupingKeyInfos;
+    groupingKeyInfos.reserve(groupId->groupingKeyInfos().size());
+    for (const auto& key : groupId->groupingKeyInfos()) {
+      const auto& type = source->outputType()->findChild(key.input->name());
+      VELOX_USER_CHECK(
+          *type == *key.input->type(),
+          "Compact aggregation state cannot be a GroupId grouping key: {}",
+          key.input->name());
+      groupingKeyInfos.push_back(
+          {key.output,
+           std::make_shared<core::FieldAccessTypedExpr>(
+               type, key.input->name())});
+    }
+
+    std::vector<core::FieldAccessTypedExprPtr> aggregationInputs;
+    aggregationInputs.reserve(groupId->aggregationInputs().size());
+    for (const auto& input : groupId->aggregationInputs()) {
+      aggregationInputs.push_back(
+          std::make_shared<core::FieldAccessTypedExpr>(
+              source->outputType()->findChild(input->name()), input->name()));
+    }
+    return finish(
+        core::GroupIdNode::Builder(*groupId)
+            .groupingKeyInfos(std::move(groupingKeyInfos))
+            .aggregationInputs(std::move(aggregationInputs))
+            .source(source)
+            .build());
+  }
+
+  if (const auto* window = dynamic_cast<const core::WindowNode*>(node.get())) {
+    auto sourceExpected = window->inputType();
+    if (compactInput) {
+      VELOX_USER_CHECK_NOT_NULL(expected);
+      VELOX_USER_CHECK_EQ(expected->size(), window->outputType()->size());
+      auto inputTypes = sourceExpected->children();
+      for (size_t i = 0; i < inputTypes.size(); ++i) {
+        VELOX_USER_CHECK_EQ(expected->nameOf(i), sourceExpected->nameOf(i));
+        inputTypes[i] = expected->childAt(i);
+      }
+      for (size_t i = inputTypes.size(); i < expected->size(); ++i) {
+        VELOX_USER_CHECK(
+            *expected->childAt(i) == *window->outputType()->childAt(i),
+            "Compact state cannot change a Window result column");
+      }
+      sourceExpected = ROW(sourceExpected->names(), std::move(inputTypes));
+    }
+    for (const auto& key : window->partitionKeys()) {
+      checkFields(key, sourceExpected);
+    }
+    for (const auto& key : window->sortingKeys()) {
+      checkFields(key, sourceExpected);
+    }
+    for (const auto& function : window->windowFunctions()) {
+      checkFields(function.functionCall, sourceExpected);
+      if (function.frame.startValue) {
+        checkFields(function.frame.startValue, sourceExpected);
+      }
+      if (function.frame.endValue) {
+        checkFields(function.frame.endValue, sourceExpected);
+      }
+    }
+    auto source =
+        rewriteNode(window->sources()[0], sourceExpected, compactInput);
+    if (source == window->sources()[0]) {
+      return finish(node);
+    }
+    return finish(core::WindowNode::Builder(*window).source(source).build());
+  }
+
+  if (const auto* singleRow =
+          dynamic_cast<const core::EnforceSingleRowNode*>(node.get())) {
+    auto source = rewriteNode(
+        singleRow->sources()[0],
+        compactInput ? expected : singleRow->sources()[0]->outputType(),
+        compactInput);
+    if (source == singleRow->sources()[0]) {
+      return finish(node);
+    }
+    return finish(
+        core::EnforceSingleRowNode::Builder(*singleRow).source(source).build());
   }
 
   if (const auto* local =
