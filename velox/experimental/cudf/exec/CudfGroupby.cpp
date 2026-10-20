@@ -40,6 +40,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
@@ -144,14 +145,25 @@ struct StreamingGroupbyDecimalAggregator final : StreamingGroupbyAggregator {
   StreamingGroupbyDecimalAggregator(
       column_index_t inputIndex,
       TypePtr resultType,
-      bool average)
+      bool average,
+      bool compactDecimalState)
       : StreamingGroupbyAggregator(inputIndex, std::move(resultType)),
-        average_(average) {}
+        average_(average),
+        compactDecimalState_(compactDecimalState) {}
 
   void prepareInput(
       cudf::table_view input,
       std::vector<cudf::column_view>& preparedColumns,
       cuda::stream_ref stream) override {
+    if (compactDecimalState_) {
+      const cudf::structs_column_view state(input.column(inputIndex));
+      VELOX_CHECK_EQ(state.num_children(), 2);
+      VELOX_CHECK(!state.has_nulls());
+      preparedInputIndex_ = preparedColumns.size();
+      preparedColumns.push_back(state.get_sliced_child(0, stream));
+      preparedColumns.push_back(state.get_sliced_child(1, stream));
+      return;
+    }
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     auto decoded = cudf_velox::deserializeDecimalSumState(
         input.column(inputIndex), scale, stream, get_temp_mr());
@@ -204,6 +216,7 @@ struct StreamingGroupbyDecimalAggregator final : StreamingGroupbyAggregator {
 
  private:
   const bool average_;
+  const bool compactDecimalState_;
   std::optional<column_index_t> preparedInputIndex_;
   size_t resultIndex_{0};
   std::unique_ptr<cudf::column> decodedSum_;
@@ -459,16 +472,16 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       VectorPtr constant,
       const TypePtr& resultType,
       std::optional<uint32_t> maskIndex,
-      bool compactDecimalSum)
+      bool compactDecimalState)
       : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex),
-        compactDecimalSum_(compactDecimalSum) {}
+        compactDecimalState_(compactDecimalState) {}
 
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    if (compactDecimalSum_) {
+    if (compactDecimalState_) {
       auto input = materializeMaskedInput(tbl, inputIndex, stream, mr);
       if (!exec::isRawInput(step)) {
         VELOX_CHECK(
@@ -510,7 +523,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
-    if (compactDecimalSum_) {
+    if (compactDecimalState_) {
       return col;
     }
     if (step == core::AggregationNode::Step::kPartial) {
@@ -543,7 +556,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       rmm::device_async_resource_ref mr) override {
     VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
     const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
-    if (compactDecimalSum_) {
+    if (compactDecimalState_) {
       return state->type() == outputType
           ? std::move(state)
           : cudf::cast(*state, outputType, stream, mr);
@@ -565,7 +578,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
   // alive while the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
-  const bool compactDecimalSum_;
+  const bool compactDecimalState_;
 };
 
 struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
@@ -573,13 +586,10 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       core::AggregationNode::Step step,
       uint32_t inputIndex,
       VectorPtr constant,
-      const TypePtr& resultType)
-      : GroupbyAggregator(
-            step,
-            inputIndex,
-            constant,
-            resultType,
-            std::nullopt) {}
+      const TypePtr& resultType,
+      bool compactDecimalState)
+      : GroupbyAggregator(step, inputIndex, constant, resultType, std::nullopt),
+        compactDecimalState_(compactDecimalState) {}
 
   // Decimal avg uses a dedicated path that does not honor masks; masked avg
   // already falls back to CPU (see canGroupbyBeEvaluatedByCudf).
@@ -589,7 +599,20 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref /*mr*/) override {
     VELOX_CHECK(!maskIndex.has_value(), "decimal avg does not support masks");
-    if (step == core::AggregationNode::Step::kIntermediate ||
+    if (compactDecimalState_ && !exec::isRawInput(step)) {
+      const cudf::structs_column_view state(tbl.column(inputIndex));
+      VELOX_CHECK_EQ(state.num_children(), 2);
+      VELOX_CHECK(!state.has_nulls());
+      sumIdx_ = requests.size();
+      countIdx_ = sumIdx_ + 1;
+      for (int child = 0; child < 2; ++child) {
+        auto& request = requests.emplace_back();
+        request.values = state.get_sliced_child(child, stream);
+        request.aggregations.push_back(
+            cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+      }
+    } else if (
+        step == core::AggregationNode::Step::kIntermediate ||
         step == core::AggregationNode::Step::kFinal) {
       addDecimalDecodedSumCountRequests(
           tbl,
@@ -618,6 +641,33 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     auto col = std::move(results[sumIdx_].results[0]);
+    if (compactDecimalState_) {
+      auto count = exec::isRawInput(step)
+          ? std::move(results[sumIdx_].results[1])
+          : std::move(results[countIdx_].results[0]);
+      if (!exec::isPartialOutput(step)) {
+        return finalizeDecimalAverage(
+            std::move(col), std::move(count), resultType, stream, mr);
+      }
+      const auto size = col->size();
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(col));
+      children.push_back(
+          cudf_velox::castCountColumnToInt64(std::move(count), stream));
+      // The parent is always valid. An all-null group has a null sum and zero
+      // count, so merging children independently preserves empty groups.
+      return cudf::make_structs_column(
+          size,
+          std::move(children),
+          0,
+          cudf::create_null_mask(
+              0,
+              cudf::mask_state::UNALLOCATED,
+              stream,
+              cudf::memory_resources{mr, get_temp_mr()}),
+          stream,
+          mr);
+    }
     if (step == core::AggregationNode::Step::kSingle) {
       auto count = std::move(results[sumIdx_].results[1]);
       return finalizeDecimalAverage(
@@ -654,6 +704,18 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
+    if (compactDecimalState_) {
+      VELOX_CHECK(state->type().id() == cudf::type_id::STRUCT);
+      VELOX_CHECK_EQ(state->num_children(), 2);
+      VELOX_CHECK_EQ(state->null_count(), 0);
+      auto contents = state->release();
+      return finalizeDecimalAverage(
+          std::move(contents.children[0]),
+          std::move(contents.children[1]),
+          resultType,
+          stream,
+          mr);
+    }
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     auto decoded = cudf_velox::deserializeDecimalSumState(
         state->view(), scale, stream, get_temp_mr());
@@ -673,6 +735,7 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
   // alive while the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
+  const bool compactDecimalState_;
 };
 
 struct GroupbyCountAggregator : GroupbyAggregator {
@@ -1183,7 +1246,7 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
           p.constant,
           p.resultType,
           p.maskIndex,
-          p.compactDecimalSum);
+          p.compactDecimalState);
     }
     return std::make_unique<GroupbySumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -1204,7 +1267,11 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
   } else if (kind.rfind(prefix + "avg", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<GroupbyDecimalAvgAggregator>(
-          p.companionStep, p.inputIndex, p.constant, p.resultType);
+          p.companionStep,
+          p.inputIndex,
+          p.constant,
+          p.resultType,
+          p.compactDecimalState);
     }
     return std::make_unique<GroupbyMeanAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -1244,12 +1311,12 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
              cudf::data_type{cudf::type_id::INT64}, cudf::aggregation::SUM))) {
       return nullptr;
     }
-    if (aggregate.compactDecimalSum) {
+    if (aggregate.compactDecimalState && !average) {
       return std::make_unique<StreamingGroupbySumAggregator>(
           inputIndex, resultType);
     }
     return std::make_unique<StreamingGroupbyDecimalAggregator>(
-        inputIndex, resultType, average);
+        inputIndex, resultType, average, aggregate.compactDecimalState);
   }
   if (aggregate.kind == prefix + "sum") {
     if (!cudf::groupby::is_streaming_groupby_supported(
@@ -1415,7 +1482,7 @@ bool canGroupbyBeEvaluatedByCudf(
   // registry whose decimal intermediate type is VARBINARY.
   for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
     const auto& aggregate = aggregationNode.aggregates()[i];
-    if (!(cudfNode && cudfNode->usesCompactDecimalSum(i)) &&
+    if (!(cudfNode && cudfNode->usesCompactDecimalState(i)) &&
         !canGroupbyAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
       return false;

@@ -30,7 +30,7 @@ class CudfAggregationNode final : public core::AggregationNode {
       const core::AggregationNode& node,
       std::vector<TypePtr> compactIntermediateTypes);
 
-  bool usesCompactDecimalSum(size_t index) const {
+  bool usesCompactDecimalState(size_t index) const {
     return compactIntermediateTypes_.at(index) != nullptr;
   }
 
@@ -39,10 +39,12 @@ class CudfAggregationNode final : public core::AggregationNode {
     return compactIntermediateTypes_.at(index);
   }
 
-  /// Returns DECIMAL(38, raw input scale) for plain Decimal64 SUM, otherwise
-  /// nullptr. Modifiers on Decimal64 SUM are rejected rather than allowing
-  /// producer and consumer fragments to choose different state protocols.
-  static TypePtr compactIntermediateType(const Aggregate& aggregate);
+  /// Returns DECIMAL(38, scale) for Decimal64 SUM, or ROW(sum DECIMAL(38,
+  /// scale), count BIGINT) for grouped Decimal64 AVG; nullptr otherwise.
+  /// Modifiers are rejected so producers and consumers use the same protocol.
+  static TypePtr compactIntermediateType(
+      const Aggregate& aggregate,
+      bool grouped);
 
   std::string_view name() const override {
     return "CudfAggregation";

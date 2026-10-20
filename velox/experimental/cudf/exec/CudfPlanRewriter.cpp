@@ -170,7 +170,8 @@ PlanNodePtr rewriteNode(
         continue;
       }
       auto& aggregate = aggregates[i];
-      auto stateType = CudfAggregationNode::compactIntermediateType(aggregate);
+      auto stateType = CudfAggregationNode::compactIntermediateType(
+          aggregate, !aggregation->groupingKeys().empty());
       if (!stateType) {
         continue;
       }
@@ -184,17 +185,20 @@ PlanNodePtr rewriteNode(
       VELOX_USER_CHECK(
           *field.type() == *originalInput ||
               (!rawInput && *field.type() == *stateType),
-          "Unexpected Decimal64 SUM input type");
+          "Unexpected compact decimal aggregation input type");
       VELOX_USER_CHECK(
           *inputType->childAt(channel) == *field.type(),
-          "Decimal64 SUM input does not match its source");
+          "Compact decimal aggregation input does not match its source");
       const bool partialOutput = step == AggregationNode::Step::kPartial ||
           step == AggregationNode::Step::kIntermediate;
+      const auto resultType = !partialOutput && stateType->isRow()
+          ? aggregate.rawInputTypes[0]
+          : stateType;
       VELOX_USER_CHECK(
           *aggregate.call->type() ==
-                  *(partialOutput ? VARBINARY() : stateType) ||
-              *aggregate.call->type() == *stateType,
-          "Unexpected Decimal64 SUM result type");
+                  *(partialOutput ? VARBINARY() : resultType) ||
+              *aggregate.call->type() == *resultType,
+          "Unexpected compact decimal aggregation result type");
       if (!rawInput) {
         VELOX_USER_CHECK(
             *inputTypes[channel] == *inputType->childAt(channel) ||
@@ -204,7 +208,7 @@ PlanNodePtr rewriteNode(
         inputTypes[channel] = stateType;
       }
       aggregate.call = std::make_shared<core::CallTypedExpr>(
-          stateType,
+          resultType,
           std::vector<core::TypedExprPtr>{
               std::make_shared<core::FieldAccessTypedExpr>(
                   rawInput ? aggregate.rawInputTypes[0] : stateType,

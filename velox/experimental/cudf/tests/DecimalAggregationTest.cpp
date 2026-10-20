@@ -1538,15 +1538,20 @@ TEST_F(CudfDecimalTest, compactSumGroupedMixedAggregates) {
     while (auto* aggregation =
                dynamic_cast<const CudfAggregationNode*>(node.get())) {
       ++stages;
-      EXPECT_TRUE(aggregation->usesCompactDecimalSum(0));
-      EXPECT_FALSE(aggregation->usesCompactDecimalSum(1));
+      EXPECT_TRUE(aggregation->usesCompactDecimalState(0));
+      EXPECT_TRUE(aggregation->usesCompactDecimalState(1));
       EXPECT_EQ(*aggregation->intermediateType(0), *DECIMAL(38, 2));
+      EXPECT_EQ(
+          *aggregation->intermediateType(1),
+          *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
       node = node->sources()[0];
       if (auto* partition =
               dynamic_cast<const core::LocalPartitionNode*>(node.get())) {
         EXPECT_EQ(partition->name(), "LocalPartition");
         EXPECT_EQ(*partition->outputType()->childAt(1), *DECIMAL(38, 2));
-        EXPECT_EQ(*partition->outputType()->childAt(2), *VARBINARY());
+        EXPECT_EQ(
+            *partition->outputType()->childAt(2),
+            *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
         node = partition->sources()[0];
       }
     }
@@ -1598,9 +1603,12 @@ TEST_F(CudfDecimalTest, streamingCompactSumThroughLocalExchange) {
           .planNode());
   const auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
   ASSERT_NE(final, nullptr);
-  ASSERT_TRUE(final->usesCompactDecimalSum(0));
-  ASSERT_FALSE(final->usesCompactDecimalSum(1));
-  ASSERT_FALSE(final->usesCompactDecimalSum(2));
+  ASSERT_TRUE(final->usesCompactDecimalState(0));
+  ASSERT_FALSE(final->usesCompactDecimalState(1));
+  ASSERT_TRUE(final->usesCompactDecimalState(2));
+  ASSERT_EQ(
+      *plan->sources()[0]->outputType()->childAt(3),
+      *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
   ASSERT_EQ(*plan->sources()[0]->outputType()->childAt(1), *DECIMAL(38, 2));
 
   auto task = exec::test::AssertQueryBuilder(plan)
@@ -1614,6 +1622,260 @@ TEST_F(CudfDecimalTest, streamingCompactSumThroughLocalExchange) {
           .customStats.at(std::string{kStreamingGroupbyUsedStat})
           .sum,
       0);
+}
+
+TEST_F(CudfDecimalTest, compactAvgGroupedBatches) {
+  auto& config = CudfConfig::getInstance();
+  const auto savedEnabled = config.streamingGroupbyEnabled;
+  SCOPE_EXIT {
+    config.streamingGroupbyEnabled = savedEnabled;
+  };
+
+  constexpr int64_t kBig = 999'999'999'999'999'999;
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({0, 0, 1, 1, 2, 2, 3, 3, 4, 5}),
+       makeNullableFlatVector<int64_t>(
+           {std::nullopt,
+            std::nullopt,
+            100,
+            -100,
+            100,
+            101,
+            -100,
+            -101,
+            kBig,
+            100},
+           DECIMAL(18, 2))});
+  auto tail = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5}),
+       makeNullableFlatVector<int64_t>(
+           {std::nullopt, std::nullopt, std::nullopt, std::nullopt, kBig, 300},
+           DECIMAL(18, 2))});
+  // The large group's sum exceeds INT64_MAX. The last group has unequal
+  // partial counts, so averaging partial averages would give the wrong result.
+  std::vector<RowVectorPtr> batches(10, input);
+  batches.push_back(tail);
+  auto expected = makeRowVector(
+      {"k", "a"},
+      {makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5}),
+       makeNullableFlatVector<int64_t>(
+           {std::nullopt, 0, 101, -101, kBig, 118}, DECIMAL(18, 2))});
+
+  for (bool streaming : {false, true}) {
+    config.streamingGroupbyEnabled = streaming;
+    for (bool intermediate : {false, true}) {
+      SCOPED_TRACE(
+          fmt::format(
+              "streaming={}, intermediate={}", streaming, intermediate));
+      auto builder = exec::test::PlanBuilder();
+      builder.values(batches)
+          .partialAggregation({"k"}, {"avg(d) AS a"})
+          .localPartition({"k"});
+      if (intermediate) {
+        builder.intermediateAggregation();
+      }
+      auto original = builder.finalAggregation().planNode();
+      auto plan = CudfPlanRewriter::rewrite(original);
+      auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+      ASSERT_NE(final, nullptr);
+      EXPECT_TRUE(final->usesCompactDecimalState(0));
+      EXPECT_EQ(
+          *final->intermediateType(0),
+          *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
+      EXPECT_EQ(*plan->outputType(), *original->outputType());
+      auto task =
+          exec::test::AssertQueryBuilder(plan)
+              .maxDrivers(1)
+              .config(CudfFromVelox::kGpuBatchSizeRows, 10)
+              .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+              .assertResults(expected);
+      if (streaming) {
+        const auto stats = exec::toPlanStats(task->taskStats());
+        EXPECT_GT(
+            stats.at(plan->id())
+                .customStats.at(std::string{kStreamingGroupbyUsedStat})
+                .sum,
+            0);
+      }
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, compactAvgGroupedEmpty) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2))});
+  auto plan = CudfPlanRewriter::rewrite(
+      exec::test::PlanBuilder()
+          .values({input})
+          .filter("k < 0")
+          .partialAggregation({"k"}, {"avg(d) AS a"})
+          .intermediateAggregation()
+          .finalAggregation()
+          .planNode());
+  exec::test::AssertQueryBuilder(plan).assertResults(makeRowVector(
+      {"k", "a"},
+      {makeFlatVector<int32_t>({}),
+       makeFlatVector<int64_t>({}, DECIMAL(12, 2))}));
+}
+
+TEST_F(CudfDecimalTest, compactAvgThroughRenamedProject) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1, 1, 2}),
+       makeNullableFlatVector<int64_t>(
+           {100, 201, std::nullopt}, DECIMAL(12, 2))});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto partial = exec::test::PlanBuilder(ids)
+                     .values({input})
+                     .partialAggregation({"k"}, {"avg(d) AS a"})
+                     .planNode();
+  auto original =
+      exec::test::PlanBuilder(partial, ids)
+          .project({"a AS state", "k AS key"})
+          .localPartition({"key"})
+          .finalAggregation({"key"}, {"avg(state) AS mean"}, {{DECIMAL(12, 2)}})
+          .planNode();
+  auto plan = CudfPlanRewriter::rewrite(original);
+  const auto stateType = ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}});
+  EXPECT_EQ(*plan->sources()[0]->outputType()->childAt(0), *stateType);
+  EXPECT_EQ(
+      *plan->sources()[0]->sources()[0]->outputType()->childAt(0), *stateType);
+  EXPECT_EQ(*plan->outputType(), *original->outputType());
+  exec::test::AssertQueryBuilder(plan).maxDrivers(2).assertResults(
+      makeRowVector(
+          {"key", "mean"},
+          {makeFlatVector<int32_t>({1, 2}),
+           makeNullableFlatVector<int64_t>(
+               {151, std::nullopt}, DECIMAL(12, 2))}));
+}
+
+TEST_F(CudfDecimalTest, compactAvgSlicedStateAndFinalization) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2))});
+  auto plan = CudfPlanRewriter::rewrite(
+      exec::test::PlanBuilder()
+          .values({input})
+          .partialAggregation({"k"}, {"avg(d) AS a"})
+          .finalAggregation()
+          .planNode());
+  auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+  ASSERT_NE(final, nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  const std::vector<bool> valid{true, true, true, false, true};
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(
+      makeDecimalColumn<int128_t>({999, 201, -201, 0, 999}, 2, &valid, stream));
+  children.push_back(makeInt64Column({99, 2, 2, 0, 99}, nullptr, stream));
+  auto state = cudf::make_structs_column(
+      5,
+      std::move(children),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+      stream,
+      mr);
+  auto slice = cudf::slice(state->view(), {1, 4}, stream)[0];
+  auto keys = makeFixedWidthColumn<int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, {1, 2, 3}, nullptr, stream);
+  cudf::table_view table({keys->view(), slice});
+
+  auto aggregators = toGroupbyAggregators(
+      *final, final->step(), final->outputType(), {nullptr}, {});
+  ASSERT_EQ(aggregators.size(), 1);
+  std::vector<cudf::groupby::aggregation_request> requests;
+  aggregators[0]->addGroupbyRequest(table, requests, stream, mr);
+  ASSERT_EQ(requests.size(), 2);
+  EXPECT_EQ(
+      copyColumnData<int128_t>(requests[0].values, stream),
+      (std::vector<int128_t>{201, -201, 0}));
+  EXPECT_EQ(requests[0].values.null_count(), 1);
+  EXPECT_EQ(
+      copyColumnData<int64_t>(requests[1].values, stream),
+      (std::vector<int64_t>{2, 2, 0}));
+  auto checkAverage = [&](const cudf::column_view& result) {
+    EXPECT_EQ(result.type(), cudf::data_type(cudf::type_id::DECIMAL64, -2));
+    ASSERT_EQ(result.size(), 3);
+    const auto values = copyColumnData<int64_t>(result, stream);
+    EXPECT_EQ(values[0], 101);
+    EXPECT_EQ(values[1], -101);
+    EXPECT_EQ(result.null_count(), 1);
+    const auto mask = copyNullMask(result, stream);
+    EXPECT_TRUE(isValidAt(mask, 0));
+    EXPECT_TRUE(isValidAt(mask, 1));
+    EXPECT_FALSE(isValidAt(mask, 2));
+  };
+  auto result = aggregators[0]->finalize(
+      std::make_unique<cudf::column>(slice, stream, mr), stream, mr);
+  checkAverage(result->view());
+
+  auto streaming = toStreamingGroupbyAggregators(
+      *final,
+      final->sources()[0]->outputType(),
+      {0, 1},
+      final->outputType(),
+      {nullptr},
+      {});
+  ASSERT_TRUE(streaming.has_value());
+  ASSERT_EQ(streaming->size(), 1);
+  std::vector<cudf::column_view> prepared;
+  streaming->at(0)->prepareInput(table, prepared, stream);
+  ASSERT_EQ(prepared.size(), 2);
+  EXPECT_EQ(
+      copyColumnData<int128_t>(prepared[0], stream),
+      (std::vector<int128_t>{201, -201, 0}));
+  EXPECT_EQ(prepared[0].null_count(), 1);
+  EXPECT_EQ(
+      copyColumnData<int64_t>(prepared[1], stream),
+      (std::vector<int64_t>{2, 2, 0}));
+  std::vector<cudf::groupby::streaming_aggregation_request> streamingRequests;
+  streaming->at(0)->addStreamingRequest(streamingRequests);
+  ASSERT_EQ(streamingRequests.size(), 2);
+  // Each key has one state, so the merged results equal the prepared children.
+  std::vector<cudf::groupby::aggregation_result> results(2);
+  for (size_t i = 0; i < prepared.size(); ++i) {
+    results[i].results.push_back(
+        std::make_unique<cudf::column>(prepared[i], stream, mr));
+  }
+  result = streaming->at(0)->makeOutputColumn(results, stream, mr);
+  checkAverage(result->view());
+}
+
+TEST_F(CudfDecimalTest, compactAvgLeavesGlobalAndLongDecimalsUnchanged) {
+  auto input = makeRowVector(
+      {"k", "d", "l"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int64_t>({100}, DECIMAL(12, 2)),
+       makeFlatVector<int128_t>({100}, DECIMAL(20, 2))});
+  for (const auto& keys :
+       {std::vector<std::string>{}, std::vector<std::string>{"k"}}) {
+    auto original =
+        exec::test::PlanBuilder()
+            .values({input})
+            .partialAggregation(keys, {"avg(d)", "avg(l)", "sum(l)"})
+            .finalAggregation()
+            .planNode();
+    auto plan = CudfPlanRewriter::rewrite(original);
+    const auto& stateType = plan->sources()[0]->outputType();
+    EXPECT_EQ(*stateType->childAt(keys.size() + 1), *VARBINARY());
+    EXPECT_EQ(*stateType->childAt(keys.size() + 2), *VARBINARY());
+    if (keys.empty()) {
+      EXPECT_EQ(*stateType->childAt(0), *VARBINARY());
+      EXPECT_EQ(plan->serialize(), original->serialize());
+    } else {
+      auto* final = dynamic_cast<const CudfAggregationNode*>(plan.get());
+      ASSERT_NE(final, nullptr);
+      EXPECT_TRUE(final->usesCompactDecimalState(0));
+      EXPECT_FALSE(final->usesCompactDecimalState(1));
+      EXPECT_FALSE(final->usesCompactDecimalState(2));
+    }
+    EXPECT_EQ(*plan->outputType(), *original->outputType());
+  }
 }
 
 TEST_F(CudfDecimalTest, compactSumGlobalNullZeroAndEmpty) {
@@ -1694,7 +1956,7 @@ TEST_F(CudfDecimalTest, compactSumSurroundingNodePlans) {
         aggregation->step() == core::AggregationNode::Step::kFinal) {
       auto* compact = dynamic_cast<const CudfAggregationNode*>(rewritten.get());
       ASSERT_NE(compact, nullptr);
-      EXPECT_TRUE(compact->usesCompactDecimalSum(0));
+      EXPECT_TRUE(compact->usesCompactDecimalState(0));
       EXPECT_EQ(
           *compact->sources()[0]->outputType()->childAt(1), *DECIMAL(38, 2));
       return;
@@ -1910,7 +2172,9 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kUcx);
   EXPECT_EQ(*output->outputType(), *exchange->outputType());
   EXPECT_EQ(*output->outputType()->childAt(1), *DECIMAL(38, 2));
-  EXPECT_EQ(*output->outputType()->childAt(2), *VARBINARY());
+  EXPECT_EQ(
+      *output->outputType()->childAt(2),
+      *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
   EXPECT_EQ(*producer->outputType()->childAt(1), *VARBINARY());
   EXPECT_EQ(*gpuConsumer->outputType(), *consumer->outputType());
 
@@ -1922,9 +2186,12 @@ TEST_F(CudfDecimalTest, compactSumUcxFragmentSchemasAndSerde) {
       gpuConsumer->serialize(), pool());
   auto* aggregation = dynamic_cast<const CudfAggregationNode*>(copy.get());
   ASSERT_NE(aggregation, nullptr);
-  EXPECT_TRUE(aggregation->usesCompactDecimalSum(0));
-  EXPECT_FALSE(aggregation->usesCompactDecimalSum(1));
+  EXPECT_TRUE(aggregation->usesCompactDecimalState(0));
+  EXPECT_TRUE(aggregation->usesCompactDecimalState(1));
   EXPECT_EQ(*aggregation->intermediateType(0), *DECIMAL(38, 2));
+  EXPECT_EQ(
+      *aggregation->intermediateType(1),
+      *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
   EXPECT_EQ(copy->serialize(), gpuConsumer->serialize());
 }
 
@@ -2113,8 +2380,8 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedAggregateWithCpuFallback) {
   auto rewritten = CudfPlanRewriter::rewrite(plan);
   auto* aggregation = dynamic_cast<const CudfAggregationNode*>(rewritten.get());
   ASSERT_NE(aggregation, nullptr);
-  EXPECT_TRUE(aggregation->usesCompactDecimalSum(0));
-  EXPECT_FALSE(aggregation->usesCompactDecimalSum(1));
+  EXPECT_TRUE(aggregation->usesCompactDecimalState(0));
+  EXPECT_FALSE(aggregation->usesCompactDecimalState(1));
   VELOX_ASSERT_THROW(
       exec::test::AssertQueryBuilder(rewritten)
           .config(CudfConfig::kCudfEnabled, true)
@@ -2154,7 +2421,7 @@ TEST_F(CudfDecimalTest, compactSumRejectsUnsupportedBoundariesAndModifiers) {
                     .planNode();
   VELOX_ASSERT_THROW(
       CudfPlanRewriter::rewrite(masked),
-      "Compact Decimal64 SUM does not support DISTINCT, ordering or masks");
+      "Compact Decimal64 aggregation does not support DISTINCT, ordering or masks");
   auto projected =
       exec::test::PlanBuilder(partial, ids)
           .project({"s", "1 AS computed"})

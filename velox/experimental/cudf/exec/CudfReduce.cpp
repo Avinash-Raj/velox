@@ -758,7 +758,7 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
           p.constant,
           p.resultType,
           p.maskIndex,
-          p.compactDecimalSum);
+          p.compactDecimalState);
     }
     return std::make_unique<ReduceSumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -838,7 +838,7 @@ bool canReduceBeEvaluatedByCudf(
   // registry whose decimal intermediate type is VARBINARY.
   for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
     const auto& aggregate = aggregationNode.aggregates()[i];
-    if (!(cudfNode && cudfNode->usesCompactDecimalSum(i)) &&
+    if (!(cudfNode && cudfNode->usesCompactDecimalState(i)) &&
         !canReduceAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
       return false;

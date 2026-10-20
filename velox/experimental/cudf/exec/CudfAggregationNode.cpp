@@ -19,9 +19,11 @@
 namespace facebook::velox::cudf_velox {
 
 TypePtr CudfAggregationNode::compactIntermediateType(
-    const Aggregate& aggregate) {
-  if (aggregate.call->name() !=
-          CudfConfig::getInstance().functionNamePrefix + "sum" ||
+    const Aggregate& aggregate,
+    bool grouped) {
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  const bool average = grouped && aggregate.call->name() == prefix + "avg";
+  if ((!average && aggregate.call->name() != prefix + "sum") ||
       aggregate.rawInputTypes.size() != 1 ||
       !aggregate.rawInputTypes[0]->isShortDecimal()) {
     return nullptr;
@@ -29,15 +31,16 @@ TypePtr CudfAggregationNode::compactIntermediateType(
   VELOX_USER_CHECK(
       !aggregate.distinct && aggregate.sortingKeys.empty() &&
           aggregate.sortingOrders.empty() && !aggregate.mask,
-      "Compact Decimal64 SUM does not support DISTINCT, ordering or masks");
+      "Compact Decimal64 aggregation does not support DISTINCT, ordering or masks");
   VELOX_USER_CHECK_EQ(aggregate.call->inputs().size(), 1);
   const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
       aggregate.call->inputs()[0].get());
   VELOX_USER_CHECK(
       field && field->isInputColumn(),
-      "Compact Decimal64 SUM requires a column input");
-  return DECIMAL(
-      38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
+      "Compact Decimal64 aggregation requires a column input");
+  auto sumType =
+      DECIMAL(38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
+  return average ? ROW({{"sum", sumType}, {"count", BIGINT()}}) : sumType;
 }
 
 CudfAggregationNode::CudfAggregationNode(
@@ -67,13 +70,16 @@ CudfAggregationNode::CudfAggregationNode(
     }
     hasCompactState = true;
     const auto& aggregate = aggregates()[i];
-    auto expected = compactIntermediateType(aggregate);
+    auto expected = compactIntermediateType(aggregate, !groupingKeys().empty());
     VELOX_USER_CHECK(expected && *stateType == *expected);
     const auto& input = aggregate.call->inputs()[0];
     const auto& inputType =
         step() == Step::kPartial ? aggregate.rawInputTypes[0] : stateType;
     VELOX_USER_CHECK(*input->type() == *inputType);
-    VELOX_USER_CHECK(*aggregate.call->type() == *stateType);
+    const auto& resultType = step() == Step::kFinal && stateType->isRow()
+        ? aggregate.rawInputTypes[0]
+        : stateType;
+    VELOX_USER_CHECK(*aggregate.call->type() == *resultType);
     const auto& field = static_cast<const core::FieldAccessTypedExpr&>(*input);
     VELOX_USER_CHECK(
         *sources()[0]->outputType()->findChild(field.name()) == *inputType);
