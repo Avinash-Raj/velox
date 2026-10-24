@@ -20,14 +20,20 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/type/DecimalUtil.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/strings/utilities.hpp>
+#include <cudf/structs/structs_column_view.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <limits>
+#include <string_view>
 
 namespace facebook::velox::cudf_velox {
 
@@ -298,6 +304,224 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
     out->set_null_mask(std::move(nullMask), nullCount);
   }
   return out;
+}
+
+namespace {
+
+static_assert(kDecimal128SumLimbs == detail::kDecimal128SumLimbs);
+
+std::unique_ptr<cudf::column> makeInt64Column(
+    cudf::size_type size,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  return cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64},
+      size,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+}
+
+void copyNullMask(
+    const cudf::column_view& source,
+    cudf::column& target,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (source.nullable() && source.null_count() > 0) {
+    target.set_null_mask(
+        cudf::copy_bitmask(source, stream, cudf::memory_resources{mr, mr}),
+        source.null_count());
+  }
+}
+
+void checkInt64(const cudf::column_view& column, std::string_view name) {
+  VELOX_CHECK(
+      column.type().id() == cudf::type_id::INT64,
+      "Decimal128 aggregation state requires an INT64 {} child (type is {})",
+      name,
+      cudf::type_to_name(column.type()));
+}
+
+// Rethrows the CPU DecimalSumAggregate::computeFinalValue error for a row the
+// device check rejected, so both engines report identical messages.
+[[noreturn]] void throwDecimal128SumOverflow(
+    const cudf::column_view& sum,
+    const cudf::column_view& overflow,
+    cudf::size_type row,
+    cuda::stream_ref stream) {
+  int128_t value;
+  int64_t carry;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &value,
+      sum.data<__int128_t>() + row,
+      sizeof(value),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &carry,
+      overflow.data<int64_t>() + row,
+      sizeof(carry),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  auto const adjusted = DecimalUtil::adjustSumForOverflow(value, carry);
+  VELOX_USER_CHECK(adjusted.has_value(), "Decimal overflow");
+  DecimalUtil::valueInRange(adjusted.value());
+  VELOX_FAIL(
+      "Device rejected Decimal128 SUM state ({}, {}) that the host accepts",
+      value,
+      carry);
+}
+
+} // namespace
+
+Decimal128StateChildren decimal128StateChildren(
+    const cudf::column_view& state,
+    bool average,
+    cuda::stream_ref stream) {
+  auto const numChildren = decimal128StateOverflowChild(average) + 1;
+  VELOX_CHECK(
+      state.type().id() == cudf::type_id::STRUCT &&
+          state.num_children() == numChildren,
+      "Decimal128 {} state requires a STRUCT with {} children (type is {})",
+      average ? "AVG" : "SUM",
+      numChildren,
+      cudf::type_to_name(state.type()));
+  VELOX_CHECK(
+      !state.has_nulls(), "Decimal128 aggregation state rows must be valid");
+  const cudf::structs_column_view structs(state);
+  Decimal128StateChildren children{
+      .sum = structs.get_sliced_child(kDecimal128StateSumChild, stream),
+      .count = average ? std::make_optional(structs.get_sliced_child(
+                             kDecimal128StateCountChild, stream))
+                       : std::nullopt,
+      .overflow = structs.get_sliced_child(
+          decimal128StateOverflowChild(average), stream)};
+  VELOX_CHECK(
+      children.sum.type().id() == cudf::type_id::DECIMAL128,
+      "Decimal128 aggregation state requires a DECIMAL128 sum child (type is {})",
+      cudf::type_to_name(children.sum.type()));
+  checkInt64(children.overflow, "overflow");
+  if (children.count) {
+    checkInt64(*children.count, "count");
+  }
+  return children;
+}
+
+std::vector<std::unique_ptr<cudf::column>> splitDecimal128SumLimbs(
+    const cudf::column_view& values,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(
+      values.type().id() == cudf::type_id::DECIMAL128,
+      "Decimal128 aggregation requires DECIMAL128 input (type is {})",
+      cudf::type_to_name(values.type()));
+  std::vector<std::unique_ptr<cudf::column>> limbs;
+  std::vector<cudf::mutable_column_view> limbViews;
+  for (size_t i = 0; i < kDecimal128SumLimbs; ++i) {
+    limbs.push_back(makeInt64Column(values.size(), stream, mr));
+    limbViews.push_back(limbs.back()->mutable_view());
+  }
+  detail::splitDecimal128SumLimbs(
+      values,
+      cuda::std::span<const cudf::mutable_column_view>{
+          limbViews.data(), limbViews.size()},
+      stream);
+  for (auto& limb : limbs) {
+    copyNullMask(values, *limb, stream, mr);
+  }
+  return limbs;
+}
+
+Decimal128SumOverflowColumns assembleDecimal128SumState(
+    cuda::std::span<const cudf::column_view> limbSums,
+    const cudf::column_view* overflowSum,
+    int32_t scale,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_EQ(limbSums.size(), kDecimal128SumLimbs);
+  auto const numRows = limbSums[0].size();
+  Decimal128SumOverflowColumns result;
+  result.sum = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::DECIMAL128, -scale},
+      numRows,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  result.overflow = makeInt64Column(numRows, stream, mr);
+  detail::assembleDecimal128SumState(
+      limbSums,
+      overflowSum,
+      result.sum->mutable_view(),
+      result.overflow->mutable_view(),
+      stream);
+  copyNullMask(limbSums[0], *result.sum, stream, mr);
+  return result;
+}
+
+std::unique_ptr<cudf::column> finalizeDecimal128Sum(
+    const cudf::column_view& sum,
+    const cudf::column_view& overflow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_EQ(sum.size(), overflow.size());
+  auto out = cudf::make_fixed_width_column(
+      sum.type(), sum.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  auto const invalidRow =
+      detail::finalizeDecimal128Sum(sum, overflow, out->mutable_view(), stream);
+  if (invalidRow >= 0) {
+    throwDecimal128SumOverflow(sum, overflow, invalidRow, stream);
+  }
+  copyNullMask(sum, *out, stream, mr);
+  return out;
+}
+
+std::unique_ptr<cudf::column> finalizeDecimal128Average(
+    const cudf::column_view& sum,
+    const cudf::column_view& count,
+    const cudf::column_view& overflow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  checkInt64(count, "count");
+  checkInt64(overflow, "overflow");
+  auto out = cudf::make_fixed_width_column(
+      sum.type(), sum.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  detail::averageDecimal128WithOverflow(
+      sum, count, overflow, out->mutable_view(), stream);
+  auto [nullMask, nullCount] =
+      detail::buildStateValidityMask(sum, count, stream, mr);
+  if (nullCount > 0) {
+    out->set_null_mask(std::move(nullMask), nullCount);
+  }
+  return out;
+}
+
+std::unique_ptr<cudf::column> makeDecimal128StateColumn(
+    std::unique_ptr<cudf::column> sum,
+    std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto const size = sum->size();
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(std::move(sum));
+  if (count) {
+    checkInt64(count->view(), "count");
+    children.push_back(std::move(count));
+  }
+  checkInt64(overflow->view(), "overflow");
+  children.push_back(std::move(overflow));
+  return cudf::make_structs_column(
+      size,
+      std::move(children),
+      0,
+      cudf::create_null_mask(
+          0,
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          cudf::memory_resources{mr, get_temp_mr()}),
+      stream,
+      mr);
 }
 
 } // namespace facebook::velox::cudf_velox

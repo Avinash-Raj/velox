@@ -69,6 +69,7 @@
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/serializers/PrestoSerializer.h"
+#include "velox/type/DecimalUtil.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 
@@ -290,7 +291,21 @@ class UcxExchangeTest : public UcxExchangeTestBase,
 
 // Fixture for focused behavioral tests that should run once per process rather
 // than once for every ExchangeTestParams value.
-class UcxExchangeFocusedTest : public UcxExchangeTestBase {};
+class UcxExchangeFocusedTest : public UcxExchangeTestBase {
+ protected:
+  // Runs each input in its own rewritten partial-aggregation producer task over
+  // packed UCX, merges them in a rewritten final-aggregation consumer task, and
+  // checks the compact state schemas and the consumer results. Inputs have a
+  // "k" grouping key; aggregate i reads one column of type rawTypes[i] and has
+  // compact state stateTypes[i].
+  void runCompactAggregationAcrossTasks(
+      const std::vector<RowVectorPtr>& inputs,
+      const std::vector<std::string>& partialAggregates,
+      const std::vector<std::string>& finalAggregates,
+      const std::vector<TypePtr>& rawTypes,
+      const std::vector<TypePtr>& stateTypes,
+      const RowVectorPtr& expected);
+};
 
 INSTANTIATE_TEST_SUITE_P(
     UcxExchangeTest,
@@ -971,7 +986,13 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputDataIntegrityTest";
 }
 
-TEST_F(UcxExchangeFocusedTest, compactDecimalSumAcrossTasks) {
+void UcxExchangeFocusedTest::runCompactAggregationAcrossTasks(
+    const std::vector<RowVectorPtr>& inputs,
+    const std::vector<std::string>& partialAggregates,
+    const std::vector<std::string>& finalAggregates,
+    const std::vector<TypePtr>& rawTypes,
+    const std::vector<TypePtr>& stateTypes,
+    const RowVectorPtr& expected) {
   using cudf_velox::CudfAggregationNode;
   using cudf_velox::CudfPlanRewriter;
 
@@ -1030,6 +1051,108 @@ TEST_F(UcxExchangeFocusedTest, compactDecimalSumAcrossTasks) {
           }));
   queryCtx->setRegistry(ExchangeTransportRegistry::kRegistryKey, exchanges);
 
+  const auto taskPrefix = getUniqueTaskPrefix();
+  std::vector<std::shared_ptr<Task>> producers;
+  SCOPE_EXIT {
+    for (auto& task : producers) {
+      if (task->isRunning()) {
+        task->requestAbort().wait();
+      }
+      EXPECT_TRUE(exec::waitForTaskDriversToFinish(task.get()));
+      queueManager()->removeTask(task->taskId());
+    }
+  };
+  RowTypePtr legacyStateType;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    auto plan =
+        exec::test::PlanBuilder()
+            .values({inputs[i]})
+            .partialAggregation({"k"}, partialAggregates)
+            .partitionedOutput(
+                {}, 1, false, {}, "Presto", std::string{TransportKind::kUcx})
+            .planNode();
+    legacyStateType = plan->outputType();
+    auto rewritten = CudfPlanRewriter::rewrite(plan);
+    ASSERT_NE(
+        dynamic_cast<const PartitionedOutputNode*>(rewritten.get()), nullptr);
+    auto* partial =
+        dynamic_cast<const CudfAggregationNode*>(rewritten->sources()[0].get());
+    ASSERT_NE(partial, nullptr);
+    for (size_t j = 0; j < stateTypes.size(); ++j) {
+      ASSERT_EQ(*partial->intermediateType(j), *stateTypes[j]);
+      ASSERT_EQ(*rewritten->outputType()->childAt(1 + j), *stateTypes[j]);
+    }
+    producers.push_back(
+        Task::create(
+            taskPrefix + "compactSumProducer" + std::to_string(i),
+            PlanFragment(rewritten),
+            0,
+            queryCtx,
+            Task::ExecutionMode::kParallel));
+    producers.back()->start(1);
+  }
+
+  std::vector<std::vector<TypePtr>> rawInputTypes;
+  for (const auto& rawType : rawTypes) {
+    rawInputTypes.push_back({rawType});
+  }
+  PlanNodeId exchangeId;
+  auto consumer =
+      exec::test::PlanBuilder()
+          .exchange(legacyStateType, "Presto", std::string{TransportKind::kUcx})
+          .capturePlanNodeId(exchangeId)
+          .finalAggregation({"k"}, finalAggregates, rawInputTypes)
+          .planNode();
+  auto rewrittenConsumer = CudfPlanRewriter::rewrite(consumer);
+  auto* exchange =
+      dynamic_cast<const ExchangeNode*>(rewrittenConsumer->sources()[0].get());
+  ASSERT_NE(exchange, nullptr);
+  ASSERT_EQ(exchange->name(), "Exchange");
+  for (size_t j = 0; j < stateTypes.size(); ++j) {
+    ASSERT_EQ(*exchange->outputType()->childAt(1 + j), *stateTypes[j]);
+  }
+  ASSERT_EQ(
+      *exchange->outputType(),
+      *producers[0]->planFragment().planNode->outputType());
+
+  CursorParameters params;
+  params.planNode = rewrittenConsumer;
+  params.queryCtx = queryCtx;
+  params.maxDrivers = 1;
+  auto [cursor, results] =
+      exec::test::readCursor(params, [&](TaskCursor* cursor) {
+        if (cursor->noMoreSplits()) {
+          return;
+        }
+        for (const auto& producer : producers) {
+          cursor->task()->addSplit(
+              exchangeId, remoteSplit(producer->taskId(), 0));
+        }
+        cursor->task()->noMoreSplits(exchangeId);
+        cursor->setNoMoreSplits();
+      });
+  ASSERT_TRUE(exec::test::assertEqualResults({expected}, results));
+  auto hasOperator = [](const std::shared_ptr<Task>& task,
+                        std::string_view type) {
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        if (op.operatorType == type) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  EXPECT_TRUE(hasOperator(cursor->task(), "UcxExchange"));
+  EXPECT_TRUE(hasOperator(cursor->task(), "CudfGroupbyFINAL"));
+  for (const auto& producer : producers) {
+    ASSERT_TRUE(exec::test::waitForTaskCompletion(producer.get()));
+    EXPECT_TRUE(hasOperator(producer, "cudfPartitionedOutput"));
+    EXPECT_TRUE(hasOperator(producer, "CudfGroupbyPARTIAL"));
+  }
+}
+
+TEST_F(UcxExchangeFocusedTest, compactDecimalSumAcrossTasks) {
   facebook::velox::test::VectorMaker vectors(pool_.get());
   const auto rawType = DECIMAL(18, 2);
   const auto stateType = DECIMAL(38, 2);
@@ -1057,102 +1180,56 @@ TEST_F(UcxExchangeFocusedTest, compactDecimalSumAcrossTasks) {
            vectors.flatVectorNullable<int64_t>(
                {large, large, large, large, large, std::nullopt, -125, 75},
                rawType)})};
-  const auto taskPrefix = getUniqueTaskPrefix();
-  std::vector<std::shared_ptr<Task>> producers;
-  SCOPE_EXIT {
-    for (auto& task : producers) {
-      if (task->isRunning()) {
-        task->requestAbort().wait();
-      }
-      EXPECT_TRUE(exec::waitForTaskDriversToFinish(task.get()));
-      queueManager()->removeTask(task->taskId());
-    }
-  };
-  RowTypePtr legacyStateType;
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    auto plan =
-        exec::test::PlanBuilder()
-            .values({inputs[i]})
-            .partialAggregation({"k"}, {"sum(d) AS s"})
-            .partitionedOutput(
-                {}, 1, false, {}, "Presto", std::string{TransportKind::kUcx})
-            .planNode();
-    legacyStateType = plan->outputType();
-    auto rewritten = CudfPlanRewriter::rewrite(plan);
-    ASSERT_NE(
-        dynamic_cast<const PartitionedOutputNode*>(rewritten.get()), nullptr);
-    auto* partial =
-        dynamic_cast<const CudfAggregationNode*>(rewritten->sources()[0].get());
-    ASSERT_NE(partial, nullptr);
-    ASSERT_EQ(*partial->intermediateType(0), *stateType);
-    ASSERT_EQ(*rewritten->outputType()->childAt(1), *stateType);
-    producers.push_back(
-        Task::create(
-            taskPrefix + "compactSumProducer" + std::to_string(i),
-            PlanFragment(rewritten),
-            0,
-            queryCtx,
-            Task::ExecutionMode::kParallel));
-    producers.back()->start(1);
-  }
+  runCompactAggregationAcrossTasks(
+      inputs,
+      {"sum(d) AS s"},
+      {"sum(s) AS s"},
+      {rawType},
+      {stateType},
+      vectors.rowVector(
+          {"k", "s"},
+          {vectors.flatVector<int32_t>({0, 1, 2, 3}),
+           vectors.flatVectorNullable<int128_t>(
+               {int128_t{large} * 10, std::nullopt, 0, 75}, stateType)}));
+}
 
-  PlanNodeId exchangeId;
-  auto consumer =
-      exec::test::PlanBuilder()
-          .exchange(legacyStateType, "Presto", std::string{TransportKind::kUcx})
-          .capturePlanNodeId(exchangeId)
-          .finalAggregation({"k"}, {"sum(s) AS s"}, {{rawType}})
-          .planNode();
-  auto rewrittenConsumer = CudfPlanRewriter::rewrite(consumer);
-  auto* exchange =
-      dynamic_cast<const ExchangeNode*>(rewrittenConsumer->sources()[0].get());
-  ASSERT_NE(exchange, nullptr);
-  ASSERT_EQ(exchange->name(), "Exchange");
-  ASSERT_EQ(*exchange->outputType()->childAt(1), *stateType);
-  ASSERT_EQ(
-      *exchange->outputType(),
-      *producers[0]->planFragment().planNode->outputType());
-
-  CursorParameters params;
-  params.planNode = rewrittenConsumer;
-  params.queryCtx = queryCtx;
-  params.maxDrivers = 1;
-  auto [cursor, results] =
-      exec::test::readCursor(params, [&](TaskCursor* cursor) {
-        if (cursor->noMoreSplits()) {
-          return;
-        }
-        for (const auto& producer : producers) {
-          cursor->task()->addSplit(
-              exchangeId, remoteSplit(producer->taskId(), 0));
-        }
-        cursor->task()->noMoreSplits(exchangeId);
-        cursor->setNoMoreSplits();
-      });
-  auto expected = vectors.rowVector(
-      {"k", "s"},
-      {vectors.flatVector<int32_t>({0, 1, 2, 3}),
-       vectors.flatVectorNullable<int128_t>(
-           {int128_t{large} * 10, std::nullopt, 0, 75}, stateType)});
-  ASSERT_TRUE(exec::test::assertEqualResults({expected}, results));
-  auto hasOperator = [](const std::shared_ptr<Task>& task,
-                        std::string_view type) {
-    for (const auto& pipeline : task->taskStats().pipelineStats) {
-      for (const auto& op : pipeline.operatorStats) {
-        if (op.operatorType == type) {
-          return true;
-        }
-      }
-    }
-    return false;
+TEST_F(UcxExchangeFocusedTest, compactDecimal128SumAndAvgAcrossTasks) {
+  facebook::velox::test::VectorMaker vectors(pool_.get());
+  const auto type = DECIMAL(38, 2);
+  const int128_t kMax = DecimalUtil::kLongDecimalMax;
+  // Each producer's k=0 and k=3 partials overflow 127 bits in opposite
+  // directions, so the states carry nonzero overflow over UCX and only cancel
+  // in the consumer's merge. k=1 mixes signs across producers, k=2 is all-null.
+  // AVG counts are odd so rounding cannot depend on state order.
+  auto makeInput = [&](std::vector<int32_t> keys,
+                       std::vector<std::optional<int128_t>> values) {
+    auto decimals = vectors.flatVectorNullable<int128_t>(values, type);
+    return vectors.rowVector(
+        {"k", "d"}, {vectors.flatVector<int32_t>(keys), decimals});
   };
-  EXPECT_TRUE(hasOperator(cursor->task(), "UcxExchange"));
-  EXPECT_TRUE(hasOperator(cursor->task(), "CudfGroupbyFINAL"));
-  for (const auto& producer : producers) {
-    ASSERT_TRUE(exec::test::waitForTaskCompletion(producer.get()));
-    EXPECT_TRUE(hasOperator(producer, "cudfPartitionedOutput"));
-    EXPECT_TRUE(hasOperator(producer, "CudfGroupbyPARTIAL"));
-  }
+  std::vector<RowVectorPtr> inputs{
+      makeInput(
+          {0, 0, 0, 1, 2, 3, 3},
+          {kMax, kMax, kMax, kMax, std::nullopt, -kMax, -kMax}),
+      makeInput(
+          {0, 0, 1, 1, 2, 3, 3, 3},
+          {-kMax, -kMax, 5 - kMax, 4, std::nullopt, kMax, kMax, 7})};
+  const auto sumState = ROW({{"sum", type}, {"overflow", BIGINT()}});
+  const auto avgState =
+      ROW({{"sum", type}, {"count", BIGINT()}, {"overflow", BIGINT()}});
+  runCompactAggregationAcrossTasks(
+      inputs,
+      {"sum(d) AS s", "avg(d) AS a"},
+      {"sum(s) AS s", "avg(a) AS a"},
+      {type, type},
+      {sumState, avgState},
+      vectors.rowVector(
+          {"k", "s", "a"},
+          {vectors.flatVector<int32_t>({0, 1, 2, 3}),
+           vectors.flatVectorNullable<int128_t>(
+               {kMax, 9, std::nullopt, 7}, type),
+           vectors.flatVectorNullable<int128_t>(
+               {(kMax + 1) / 5, 3, std::nullopt, 1}, type)}));
 }
 
 // Focused regression test for shared UcxExchangeClient ownership. This

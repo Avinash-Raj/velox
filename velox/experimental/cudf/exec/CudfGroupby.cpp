@@ -223,6 +223,85 @@ struct StreamingGroupbyDecimalAggregator final : StreamingGroupbyAggregator {
   std::unique_ptr<cudf::column> decodedCount_;
 };
 
+// Streaming form of GroupbyDecimal128Aggregator over native DECIMAL128 state:
+// streaming_groupby keeps exact INT64 sums of the limbs, count and overflow.
+struct StreamingGroupbyDecimal128Aggregator final : StreamingGroupbyAggregator {
+  StreamingGroupbyDecimal128Aggregator(
+      column_index_t inputIndex,
+      TypePtr resultType,
+      bool average)
+      : StreamingGroupbyAggregator(inputIndex, std::move(resultType)),
+        average_(average) {}
+
+  void prepareInput(
+      cudf::table_view input,
+      std::vector<cudf::column_view>& preparedColumns,
+      cuda::stream_ref stream) override {
+    auto children = cudf_velox::decimal128StateChildren(
+        input.column(inputIndex), average_, stream);
+    limbs_ = cudf_velox::splitDecimal128SumLimbs(
+        children.sum, stream, get_temp_mr());
+    preparedInputIndex_ = preparedColumns.size();
+    for (const auto& limb : limbs_) {
+      preparedColumns.push_back(limb->view());
+    }
+    if (average_) {
+      preparedColumns.push_back(*children.count);
+    }
+    preparedColumns.push_back(children.overflow);
+  }
+
+  void releaseInput() override {
+    limbs_.clear();
+  }
+
+  void addStreamingRequest(
+      std::vector<cudf::groupby::streaming_aggregation_request>& requests)
+      override {
+    VELOX_CHECK(preparedInputIndex_.has_value());
+    resultIndex_ = requests.size();
+    for (size_t i = 0; i < numPreparedColumns(); ++i) {
+      requests.push_back(
+          cudf::groupby::streaming_aggregation_request{
+              static_cast<cudf::size_type>(*preparedInputIndex_ + i),
+              cudf::make_sum_aggregation<cudf::groupby_aggregation>()});
+    }
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    std::vector<cudf::column_view> limbSums;
+    for (size_t i = 0; i < cudf_velox::kDecimal128SumLimbs; ++i) {
+      limbSums.push_back(results[resultIndex_ + i].results[0]->view());
+    }
+    auto next = resultIndex_ + cudf_velox::kDecimal128SumLimbs;
+    std::unique_ptr<cudf::column> count;
+    if (average_) {
+      count = std::move(results[next++].results[0]);
+    }
+    const auto overflow = results[next].results[0]->view();
+    return cudf_velox::makeDecimal128AggregateOutput(
+        {limbSums.data(), limbSums.size()},
+        &overflow,
+        std::move(count),
+        resultType,
+        stream,
+        mr);
+  }
+
+ private:
+  size_t numPreparedColumns() const {
+    return cudf_velox::kDecimal128SumLimbs + (average_ ? 2 : 1);
+  }
+
+  const bool average_;
+  std::optional<column_index_t> preparedInputIndex_;
+  size_t resultIndex_{0};
+  std::vector<std::unique_ptr<cudf::column>> limbs_;
+};
+
 struct StreamingGroupbyAverageAggregator final : StreamingGroupbyAggregator {
   StreamingGroupbyAverageAggregator(
       column_index_t inputIndex,
@@ -738,6 +817,115 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   const bool compactDecimalState_;
 };
 
+// Native-state DECIMAL128 SUM/AVG. Every input (raw values or state sums) is
+// split into 32-bit limbs whose INT64 SUMs, together with the summed overflow
+// child, give the exact value of each group. That value is re-split at 2^127
+// into the state, so intermediate overflow is carried and may cancel exactly as
+// in the CPU LongDecimalWithOverflowState; only FINAL SUM can fail.
+struct GroupbyDecimal128Aggregator : GroupbyAggregator {
+  GroupbyDecimal128Aggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      const TypePtr& resultType,
+      bool average)
+      : GroupbyAggregator(step, inputIndex, nullptr, resultType, std::nullopt),
+        average_(average) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref /*mr*/) override {
+    auto sum = tbl.column(inputIndex);
+    std::optional<cudf::column_view> count;
+    std::optional<cudf::column_view> overflow;
+    if (!exec::isRawInput(step)) {
+      auto children =
+          cudf_velox::decimal128StateChildren(sum, average_, stream);
+      sum = children.sum;
+      count = children.count;
+      overflow = children.overflow;
+    }
+    limbs_ = cudf_velox::splitDecimal128SumLimbs(sum, stream, get_temp_mr());
+    firstRequest_ = requests.size();
+    for (const auto& limb : limbs_) {
+      addRequest(
+          requests,
+          limb->view(),
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    }
+    if (average_) {
+      addRequest(
+          requests,
+          count.value_or(limbs_[0]->view()),
+          count ? cudf::make_sum_aggregation<cudf::groupby_aggregation>()
+                : cudf::make_count_aggregation<cudf::groupby_aggregation>(
+                      cudf::null_policy::EXCLUDE));
+    }
+    if (overflow) {
+      addRequest(
+          requests,
+          *overflow,
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    }
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    std::vector<cudf::column_view> limbSums;
+    for (size_t i = 0; i < cudf_velox::kDecimal128SumLimbs; ++i) {
+      limbSums.push_back(results[firstRequest_ + i].results[0]->view());
+    }
+    auto next = firstRequest_ + cudf_velox::kDecimal128SumLimbs;
+    std::unique_ptr<cudf::column> count;
+    if (average_) {
+      count = std::move(results[next++].results[0]);
+    }
+    std::optional<cudf::column_view> overflow;
+    if (!exec::isRawInput(step)) {
+      overflow = results[next].results[0]->view();
+    }
+    return cudf_velox::makeDecimal128AggregateOutput(
+        {limbSums.data(), limbSums.size()},
+        overflow ? &*overflow : nullptr,
+        std::move(count),
+        resultType,
+        stream,
+        mr);
+  }
+
+  void releaseInput() override {
+    GroupbyAggregator::releaseInput();
+    limbs_.clear();
+  }
+
+  std::unique_ptr<cudf::column> finalize(
+      std::unique_ptr<cudf::column> state,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
+    return cudf_velox::finalizeDecimal128State(
+        state->view(), average_, resultType, stream, mr);
+  }
+
+ private:
+  static void addRequest(
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      cudf::column_view values,
+      std::unique_ptr<cudf::groupby_aggregation> aggregation) {
+    auto& request = requests.emplace_back();
+    request.values = values;
+    request.aggregations.push_back(std::move(aggregation));
+  }
+
+  const bool average_;
+  size_t firstRequest_{0};
+  // Limb columns referenced by the requests until releaseInput().
+  std::vector<std::unique_ptr<cudf::column>> limbs_;
+};
+
 struct GroupbyCountAggregator : GroupbyAggregator {
   GroupbyCountAggregator(
       core::AggregationNode::Step step,
@@ -1238,6 +1426,10 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+  if (p.compactDecimalState && p.longDecimalInput) {
+    return std::make_unique<GroupbyDecimal128Aggregator>(
+        p.companionStep, p.inputIndex, p.resultType, kind == prefix + "avg");
+  }
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<GroupbyDecimalSumAggregator>(
@@ -1301,6 +1493,14 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
     const bool average = aggregate.kind == prefix + "avg";
     if (aggregate.kind != prefix + "sum" && !average) {
       return nullptr;
+    }
+    if (aggregate.compactDecimalState && aggregate.longDecimalInput) {
+      if (!cudf::groupby::is_streaming_groupby_supported(
+              cudf::data_type{cudf::type_id::INT64}, cudf::aggregation::SUM)) {
+        return nullptr;
+      }
+      return std::make_unique<StreamingGroupbyDecimal128Aggregator>(
+          inputIndex, resultType, average);
     }
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     if (!cudf::groupby::is_streaming_groupby_supported(

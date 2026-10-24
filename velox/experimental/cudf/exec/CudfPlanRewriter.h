@@ -26,7 +26,8 @@ class CudfPlanRewriter {
   /// compatible aggregate rawInputTypes. This cannot negotiate with a remote
   /// worker or prove that its fragment has been rewritten.
   ///
-  /// Supports Decimal64 SUM and grouped Decimal64 AVG stages connected
+  /// Supports Decimal64 SUM, grouped Decimal64 AVG, and Decimal128 SUM and AVG
+  /// (see CudfAggregationNode::compactIntermediateType) stages connected
   /// directly, through LocalPartition, or through UCX
   /// PartitionedOutput/Exchange. Other node classes are retained; unsupported
   /// bridges and non-UCX compact boundaries fail closed. SINGLE and unrelated

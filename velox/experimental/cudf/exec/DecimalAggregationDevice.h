@@ -22,6 +22,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/buffer>
+#include <cuda/std/span>
 #include <cuda/stream>
 
 #include <cstddef>
@@ -138,5 +139,79 @@ buildStateValidityMask(
     const cudf::column_view& countCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
+
+// Number of 32-bit limbs a DECIMAL128 value is split into so that cuDF's INT64
+// SUM accumulates it exactly. Limbs 0-2 are unsigned and limb 3 is signed, so
+// each INT64 limb sum stays exact for fewer than 2^31 rows per group.
+constexpr int kDecimal128SumLimbs = 4;
+
+/**
+ * Writes the kDecimal128SumLimbs 32-bit limbs of each DECIMAL128 value, least
+ * significant first, widened to INT64. Null rows are left unspecified; callers
+ * apply the input null mask.
+ *
+ * @param values DECIMAL128 input; sliced views are supported.
+ * @param limbs kDecimal128SumLimbs INT64 outputs sized to values.
+ * @param stream CUDA stream for the launch.
+ */
+void splitDecimal128SumLimbs(
+    cudf::column_view values,
+    cuda::std::span<const cudf::mutable_column_view> limbs,
+    cuda::stream_ref stream);
+
+/**
+ * Reassembles per-row limb sums plus net overflow sums into the canonical
+ * (sum, overflow) state, whose exact value is sum + overflow * 2^127. sum and
+ * overflow share the sign of that value and |sum| < 2^127, which is the form
+ * DecimalUtil::addWithOverflow produces for same-signed inputs. Rows whose
+ * limb sums are null get sum = 0 and overflow = 0.
+ *
+ * @param limbSums kDecimal128SumLimbs INT64 limb sums sharing one null mask.
+ * @param overflowSum optional INT64 overflow sums; null rows count as zero.
+ * @param sum output DECIMAL128 sums.
+ * @param overflow output INT64 net overflow counts.
+ * @param stream CUDA stream for the launch.
+ */
+void assembleDecimal128SumState(
+    cuda::std::span<const cudf::column_view> limbSums,
+    const cudf::column_view* overflowSum,
+    cudf::mutable_column_view sum,
+    cudf::mutable_column_view overflow,
+    cuda::stream_ref stream);
+
+/**
+ * Applies the CPU DecimalSumAggregate final check to each valid row: the value
+ * sum + overflow * 2^127 must fit int128 (DecimalUtil::adjustSumForOverflow)
+ * and DECIMAL(38) (DecimalUtil::valueInRange). Writes that value to out.
+ *
+ * @param sum DECIMAL128 state sums; null rows are skipped.
+ * @param overflow INT64 net overflow counts.
+ * @param out output DECIMAL128 values sized to sum.
+ * @param stream CUDA stream for the launch.
+ * @return index of the first row that fails either check, or -1.
+ */
+cudf::size_type finalizeDecimal128Sum(
+    cudf::column_view sum,
+    cudf::column_view overflow,
+    cudf::mutable_column_view out,
+    cuda::stream_ref stream);
+
+/**
+ * Per-row DecimalUtil::computeAverage over sum + overflow * 2^127 and count,
+ * including its half-up rounding; count == 0 writes zero (validity is applied
+ * separately).
+ *
+ * @param sum DECIMAL128 state sums.
+ * @param counts INT64 counts.
+ * @param overflow INT64 net overflow counts.
+ * @param out output DECIMAL128 averages sized to sum.
+ * @param stream CUDA stream for the launch.
+ */
+void averageDecimal128WithOverflow(
+    cudf::column_view sum,
+    cudf::column_view counts,
+    cudf::column_view overflow,
+    cudf::mutable_column_view out,
+    cuda::stream_ref stream);
 
 } // namespace facebook::velox::cudf_velox::detail

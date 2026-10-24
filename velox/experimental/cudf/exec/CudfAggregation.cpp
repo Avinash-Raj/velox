@@ -248,7 +248,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
             : std::nullopt,
         maskIndex,
         isDecimalAggregate,
-        compactDecimalState);
+        compactDecimalState,
+        isDecimalAggregate && aggregate.rawInputTypes[0]->isLongDecimal());
   }
   return params;
 }

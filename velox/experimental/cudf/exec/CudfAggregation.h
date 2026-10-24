@@ -89,6 +89,8 @@ struct ResolvedAggregateInfo {
   // VARBINARY/STRING on intermediate and final steps).
   bool isDecimalAggregate;
   bool compactDecimalState;
+  // True if the single raw input is a long (DECIMAL128) decimal.
+  bool longDecimalInput;
 };
 
 // Parse aggregate inputs from the aggregation node and resolve companion steps,

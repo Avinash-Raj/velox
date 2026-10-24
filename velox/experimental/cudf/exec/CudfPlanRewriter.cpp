@@ -191,9 +191,9 @@ PlanNodePtr rewriteNode(
           "Compact decimal aggregation input does not match its source");
       const bool partialOutput = step == AggregationNode::Step::kPartial ||
           step == AggregationNode::Step::kIntermediate;
-      const auto resultType = !partialOutput && stateType->isRow()
-          ? aggregate.rawInputTypes[0]
-          : stateType;
+      const auto resultType = partialOutput
+          ? stateType
+          : CudfAggregationNode::compactResultType(aggregate);
       VELOX_USER_CHECK(
           *aggregate.call->type() ==
                   *(partialOutput ? VARBINARY() : resultType) ||

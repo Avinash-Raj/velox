@@ -85,4 +85,81 @@ std::unique_ptr<cudf::column> finalizeDecimalAverage(
   return avgCol;
 }
 
+namespace {
+
+std::unique_ptr<cudf::column> castToType(
+    std::unique_ptr<cudf::column> column,
+    const TypePtr& type,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto const cudfType = veloxToCudfDataType(type);
+  if (column->type() != cudfType) {
+    column = cudf::cast(column->view(), cudfType, stream, mr);
+  }
+  return column;
+}
+
+} // namespace
+
+std::unique_ptr<cudf::column> makeDecimal128AggregateOutput(
+    cuda::std::span<const cudf::column_view> limbSums,
+    const cudf::column_view* overflowSum,
+    std::unique_ptr<cudf::column> count,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const bool average = count != nullptr;
+  if (average) {
+    count = castToType(std::move(count), BIGINT(), stream, mr);
+    VELOX_CHECK(
+        !count->has_nulls(), "Decimal128 AVG state counts must not be null");
+  }
+  if (!resultType->isRow()) {
+    auto state = assembleDecimal128SumState(
+        limbSums,
+        overflowSum,
+        getDecimalPrecisionScale(*resultType).second,
+        stream,
+        get_temp_mr());
+    auto result = average
+        ? finalizeDecimal128Average(
+              state.sum->view(),
+              count->view(),
+              state.overflow->view(),
+              stream,
+              mr)
+        : finalizeDecimal128Sum(
+              state.sum->view(), state.overflow->view(), stream, mr);
+    return castToType(std::move(result), resultType, stream, mr);
+  }
+  VELOX_CHECK_EQ(resultType->size(), decimal128StateOverflowChild(average) + 1);
+  auto state = assembleDecimal128SumState(
+      limbSums,
+      overflowSum,
+      getDecimalPrecisionScale(*resultType->childAt(kDecimal128StateSumChild))
+          .second,
+      stream,
+      mr);
+  return makeDecimal128StateColumn(
+      std::move(state.sum),
+      std::move(count),
+      std::move(state.overflow),
+      stream,
+      mr);
+}
+
+std::unique_ptr<cudf::column> finalizeDecimal128State(
+    const cudf::column_view& state,
+    bool average,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto const children = decimal128StateChildren(state, average, stream);
+  auto result = average
+      ? finalizeDecimal128Average(
+            children.sum, *children.count, children.overflow, stream, mr)
+      : finalizeDecimal128Sum(children.sum, children.overflow, stream, mr);
+  return castToType(std::move(result), resultType, stream, mr);
+}
+
 } // namespace facebook::velox::cudf_velox

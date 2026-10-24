@@ -20,6 +20,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
+#include <cuda/std/span>
 #include <cuda/stream>
 
 #include <memory>
@@ -101,6 +102,43 @@ std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/**
+ * Converts per-group INT64 SUMs of the DECIMAL128 limbs (see
+ * splitDecimal128SumLimbs), of the overflow child, and of the count into the
+ * native DECIMAL128 SUM/AVG state when 'resultType' is that ROW state, or into
+ * the finalized SUM/AVG otherwise.
+ *
+ * @param limbSums kDecimal128SumLimbs per-group limb sums.
+ * @param overflowSum per-group overflow sums, or nullptr for raw input.
+ * @param count per-group non-null input counts for AVG, nullptr for SUM.
+ * @param resultType native state ROW or final DECIMAL type.
+ * @param stream CUDA stream for device work.
+ * @param mr memory resource for the output.
+ */
+std::unique_ptr<cudf::column> makeDecimal128AggregateOutput(
+    cuda::std::span<const cudf::column_view> limbSums,
+    const cudf::column_view* overflowSum,
+    std::unique_ptr<cudf::column> count,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/**
+ * Finalizes one already-merged native DECIMAL128 SUM/AVG state per row.
+ *
+ * @param state native state column.
+ * @param average true for AVG, false for SUM.
+ * @param resultType final DECIMAL type.
+ * @param stream CUDA stream for device work.
+ * @param mr memory resource for the output.
+ */
+std::unique_ptr<cudf::column> finalizeDecimal128State(
+    const cudf::column_view& state,
+    bool average,
     const TypePtr& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);

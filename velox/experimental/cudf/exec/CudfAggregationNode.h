@@ -39,12 +39,22 @@ class CudfAggregationNode final : public core::AggregationNode {
     return compactIntermediateTypes_.at(index);
   }
 
-  /// Returns DECIMAL(38, scale) for Decimal64 SUM, or ROW(sum DECIMAL(38,
-  /// scale), count BIGINT) for grouped Decimal64 AVG; nullptr otherwise.
-  /// Modifiers are rejected so producers and consumers use the same protocol.
+  /// Returns the native intermediate state, nullptr when there is none:
+  ///   Decimal64 SUM: DECIMAL(38, scale)
+  ///   grouped Decimal64 AVG: ROW(sum DECIMAL(38, scale), count BIGINT)
+  ///   Decimal128 SUM: ROW(sum DECIMAL(38, scale), overflow BIGINT)
+  ///   Decimal128 AVG: ROW(sum DECIMAL(38, scale), count BIGINT,
+  ///     overflow BIGINT)
+  /// Decimal128 states hold sum + overflow * 2^127, matching the CPU
+  /// LongDecimalWithOverflowState. Modifiers are rejected so producers and
+  /// consumers use the same protocol.
   static TypePtr compactIntermediateType(
       const Aggregate& aggregate,
       bool grouped);
+
+  /// SQL result type of a FINAL aggregate with a native state: DECIMAL(38,
+  /// scale) for SUM and the raw input type for AVG.
+  static TypePtr compactResultType(const Aggregate& aggregate);
 
   std::string_view name() const override {
     return "CudfAggregation";

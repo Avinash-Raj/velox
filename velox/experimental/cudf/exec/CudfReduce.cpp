@@ -535,6 +535,93 @@ struct ReduceDecimalAvgAggregator : ReduceAggregator {
   }
 };
 
+// Global form of the native-state DECIMAL128 SUM/AVG; see
+// GroupbyDecimal128Aggregator for the limb and overflow accumulation.
+struct ReduceDecimal128Aggregator : ReduceAggregator {
+  ReduceDecimal128Aggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      const TypePtr& resultType,
+      bool average)
+      : ReduceAggregator(step, inputIndex, nullptr, resultType, std::nullopt),
+        average_(average) {}
+
+  std::unique_ptr<cudf::column> doReduce(
+      cudf::table_view const& input,
+      TypePtr const& outputType,
+      vector_size_t /* inputRowCount */,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    auto sum = input.column(inputIndex);
+    std::optional<cudf::column_view> count;
+    std::optional<cudf::column_view> overflow;
+    if (!exec::isRawInput(step)) {
+      auto children =
+          cudf_velox::decimal128StateChildren(sum, average_, stream);
+      sum = children.sum;
+      count = children.count;
+      overflow = children.overflow;
+    }
+    auto const limbs =
+        cudf_velox::splitDecimal128SumLimbs(sum, stream, get_temp_mr());
+    std::vector<std::unique_ptr<cudf::column>> limbSums;
+    std::vector<cudf::column_view> limbSumViews;
+    for (const auto& limb : limbs) {
+      limbSums.push_back(reduceSum(limb->view(), false, stream));
+      limbSumViews.push_back(limbSums.back()->view());
+    }
+    std::unique_ptr<cudf::column> countSum;
+    if (average_) {
+      countSum = count ? reduceSum(*count, true, stream)
+                       : makeInt64(sum.size() - sum.null_count(), stream);
+    }
+    std::unique_ptr<cudf::column> overflowSum;
+    if (overflow) {
+      overflowSum = reduceSum(*overflow, true, stream);
+    }
+    const auto overflowView =
+        overflowSum ? overflowSum->view() : cudf::column_view{};
+    return cudf_velox::makeDecimal128AggregateOutput(
+        {limbSumViews.data(), limbSumViews.size()},
+        overflowSum ? &overflowView : nullptr,
+        std::move(countSum),
+        outputType,
+        stream,
+        mr);
+  }
+
+ private:
+  static std::unique_ptr<cudf::column> makeInt64(
+      int64_t value,
+      cuda::stream_ref stream) {
+    return cudf::make_column_from_scalar(
+        cudf::numeric_scalar<int64_t>(value, true, stream, get_temp_mr()),
+        1,
+        stream,
+        get_temp_mr());
+  }
+
+  // INT64 SUM as a one-row column. An empty reduction is null, or zero when
+  // 'emptyIsZero' (counts and overflows of no states).
+  static std::unique_ptr<cudf::column> reduceSum(
+      cudf::column_view values,
+      bool emptyIsZero,
+      cuda::stream_ref stream) {
+    auto const result = cudf::reduce(
+        values,
+        *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+        cudf::data_type{cudf::type_id::INT64},
+        stream,
+        get_temp_mr());
+    if (emptyIsZero && !result->is_valid(stream)) {
+      return makeInt64(0, stream);
+    }
+    return cudf::make_column_from_scalar(*result, 1, stream, get_temp_mr());
+  }
+
+  const bool average_;
+};
+
 struct ApproxDistinctAggregator : ReduceAggregator {
   static constexpr cudf::null_policy kNullPolicy = cudf::null_policy::EXCLUDE;
   static constexpr cudf::nan_policy kNanPolicy = cudf::nan_policy::NAN_IS_VALID;
@@ -750,6 +837,10 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+  if (p.compactDecimalState && p.longDecimalInput) {
+    return std::make_unique<ReduceDecimal128Aggregator>(
+        p.companionStep, p.inputIndex, p.resultType, kind == prefix + "avg");
+  }
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<ReduceDecimalSumAggregator>(
