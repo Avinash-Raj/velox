@@ -55,6 +55,7 @@ using namespace facebook::velox;
 using cudf_velox::castDecimal64InputToDecimal128;
 using cudf_velox::CountInputKind;
 using cudf_velox::finalizeDecimalAverage;
+using cudf_velox::finalizeDecimalSum;
 using cudf_velox::get_output_mr;
 using cudf_velox::get_temp_mr;
 using cudf_velox::GroupbyAggregator;
@@ -207,6 +208,7 @@ struct StreamingGroupbyDecimalAggregator final : StreamingGroupbyAggregator {
       return finalizeDecimalAverage(
           std::move(sum),
           std::move(results[resultIndex_ + 1].results[0]),
+          nullptr,
           resultType,
           stream,
           mr);
@@ -367,47 +369,113 @@ using GroupbyMaxAggregator = SimpleGroupbyAggregator<
 // associated indices) in order to guarantee a lifetime constraint between
 // aggregation steps.
 
+// Long decimal sums use SUM_OVERFLOW, which reports the int128 wraps that a
+// plain SUM drops, so the state can carry them like the CPU aggregate does.
+// Sums of DECIMAL64 input cannot wrap and keep the plain SUM.
+std::unique_ptr<cudf::groupby_aggregation> makeDecimalSumAggregation(
+    bool trackOverflow) {
+  if (trackOverflow) {
+    return cudf::make_sum_overflow_aggregation<cudf::groupby_aggregation>(
+        cudf::sum_overflow_output::COUNT);
+  }
+  return cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+}
+
+// Adds a SUM request over the decoded states' overflow when the state tracks
+// it; the overflow column backs the request view until releaseInput().
+void addDecimalStateOverflowRequest(
+    std::unique_ptr<cudf::column> overflow,
+    bool trackOverflow,
+    std::vector<cudf::groupby::aggregation_request>& requests,
+    std::optional<uint32_t>& overflowIdx,
+    std::unique_ptr<cudf::column>& decodedOverflow) {
+  if (!trackOverflow) {
+    overflowIdx.reset();
+    return;
+  }
+  decodedOverflow = std::move(overflow);
+  overflowIdx = requests.size();
+  auto& request = requests.emplace_back();
+  request.values = decodedOverflow->view();
+  request.aggregations.push_back(
+      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+}
+
+// Takes the sum of a decimal SUM request and, when the state tracks overflow,
+// folds the SUM_OVERFLOW wraps and the merged states' overflow into it.
+cudf_velox::DecimalSumStateColumns takeDecimalSumResult(
+    std::vector<cudf::groupby::aggregation_result>& results,
+    uint32_t sumIdx,
+    bool trackOverflow,
+    std::optional<uint32_t> overflowIdx,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto sum = std::move(results[sumIdx].results[0]);
+  if (!trackOverflow) {
+    cudf_velox::DecimalSumStateColumns state;
+    state.sum = std::move(sum);
+    return state;
+  }
+  const auto stateOverflowSum = overflowIdx
+      ? results[*overflowIdx].results[0]->view()
+      : cudf::column_view{};
+  return cudf_velox::makeDecimalSumOverflowState(
+      std::move(sum), overflowIdx ? &stateOverflowSum : nullptr, stream, mr);
+}
+
 void addDecimalSumCountRequestsAfterDecode(
     cudf::column_view encodedColumn,
     int32_t scale,
+    bool trackOverflow,
     std::vector<cudf::groupby::aggregation_request>& requests,
     cuda::stream_ref stream,
     uint32_t& sumIdx,
     uint32_t& countIdx,
+    std::optional<uint32_t>& overflowIdx,
     std::unique_ptr<cudf::column>& decodedSum,
-    std::unique_ptr<cudf::column>& decodedCount) {
-  auto sumAndCount = cudf_velox::deserializeDecimalSumState(
+    std::unique_ptr<cudf::column>& decodedCount,
+    std::unique_ptr<cudf::column>& decodedOverflow) {
+  auto state = cudf_velox::deserializeDecimalSumState(
       encodedColumn, scale, stream, get_temp_mr());
-  decodedSum.swap(sumAndCount.sum);
-  decodedCount.swap(sumAndCount.count);
+  decodedSum.swap(state.sum);
+  decodedCount.swap(state.count);
 
   sumIdx = requests.size();
   auto& sumRequest = requests.emplace_back();
   sumRequest.values = decodedSum->view();
-  sumRequest.aggregations.push_back(
-      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  sumRequest.aggregations.push_back(makeDecimalSumAggregation(trackOverflow));
 
   countIdx = requests.size();
   auto& countRequest = requests.emplace_back();
   countRequest.values = decodedCount->view();
   countRequest.aggregations.push_back(
       cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+
+  addDecimalStateOverflowRequest(
+      std::move(state.overflow),
+      trackOverflow,
+      requests,
+      overflowIdx,
+      decodedOverflow);
 }
 
-// Decodes serialized state and adds sum + count groupby requests, used by the
-// intermediate step (both SUM and AVG) and the final AVG step. resultType is
-// DECIMAL for final AVG and DECIMAL or VARBINARY for intermediate; VARBINARY
-// carries no scale, so decode at scale 0.
+// Decodes serialized state and adds sum + count (+ overflow) groupby requests,
+// used by the intermediate step (both SUM and AVG) and the final AVG step.
+// resultType is DECIMAL for final AVG and DECIMAL or VARBINARY for
+// intermediate; VARBINARY carries no scale, so decode at scale 0.
 void addDecimalDecodedSumCountRequests(
     cudf::table_view const& tbl,
     uint32_t inputIndex,
     const TypePtr& resultType,
+    bool trackOverflow,
     std::vector<cudf::groupby::aggregation_request>& requests,
     cuda::stream_ref stream,
     uint32_t& sumIdx,
     uint32_t& countIdx,
+    std::optional<uint32_t>& overflowIdx,
     std::unique_ptr<cudf::column>& decodedSum,
-    std::unique_ptr<cudf::column>& decodedCount) {
+    std::unique_ptr<cudf::column>& decodedCount,
+    std::unique_ptr<cudf::column>& decodedOverflow) {
   validateIntermediateColumnType(tbl.column(inputIndex));
   auto scale = resultType->isDecimal()
       ? getDecimalPrecisionScale(*resultType).second
@@ -415,38 +483,50 @@ void addDecimalDecodedSumCountRequests(
   addDecimalSumCountRequestsAfterDecode(
       tbl.column(inputIndex),
       scale,
+      trackOverflow,
       requests,
       stream,
       sumIdx,
       countIdx,
+      overflowIdx,
       decodedSum,
-      decodedCount);
+      decodedCount,
+      decodedOverflow);
 }
 
 void addDecimalFinalSumOnlyRequest(
     cudf::table_view const& tbl,
     uint32_t inputIndex,
     const TypePtr& resultType,
+    bool trackOverflow,
     std::vector<cudf::groupby::aggregation_request>& requests,
     cuda::stream_ref stream,
     uint32_t& sumIdx,
-    std::unique_ptr<cudf::column>& decodedSum) {
+    std::optional<uint32_t>& overflowIdx,
+    std::unique_ptr<cudf::column>& decodedSum,
+    std::unique_ptr<cudf::column>& decodedOverflow) {
   validateIntermediateColumnType(tbl.column(inputIndex));
   auto scale = getDecimalPrecisionScale(*resultType).second;
-  auto& request = requests.emplace_back();
-  sumIdx = requests.size() - 1;
-  auto sumAndCount = cudf_velox::deserializeDecimalSumState(
+  auto state = cudf_velox::deserializeDecimalSumState(
       tbl.column(inputIndex), scale, stream, get_temp_mr());
-  decodedSum.swap(sumAndCount.sum);
+  decodedSum.swap(state.sum);
+  sumIdx = requests.size();
+  auto& request = requests.emplace_back();
   request.values = decodedSum->view();
-  request.aggregations.push_back(
-      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  request.aggregations.push_back(makeDecimalSumAggregation(trackOverflow));
+  addDecimalStateOverflowRequest(
+      std::move(state.overflow),
+      trackOverflow,
+      requests,
+      overflowIdx,
+      decodedOverflow);
 }
 
 void addDecimalRawPartialSingleSumRequest(
     cudf::column_view input,
     std::vector<cudf::groupby::aggregation_request>& requests,
     bool includeCountAggregation,
+    bool trackOverflow,
     cuda::stream_ref stream,
     uint32_t& sumIdx,
     std::unique_ptr<cudf::column>& castedInput) {
@@ -456,8 +536,7 @@ void addDecimalRawPartialSingleSumRequest(
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
   request.values = inputView;
-  request.aggregations.push_back(
-      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  request.aggregations.push_back(makeDecimalSumAggregation(trackOverflow));
   if (includeCountAggregation) {
     request.aggregations.push_back(
         cudf::make_count_aggregation<cudf::groupby_aggregation>(
@@ -472,9 +551,11 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       VectorPtr constant,
       const TypePtr& resultType,
       std::optional<uint32_t> maskIndex,
-      bool compactDecimalState)
+      bool compactDecimalState,
+      bool longDecimalInput)
       : GroupbyAggregator(step, inputIndex, constant, resultType, maskIndex),
-        compactDecimalState_(compactDecimalState) {}
+        compactDecimalState_(compactDecimalState),
+        trackOverflow_(longDecimalInput && !compactDecimalState) {}
 
   void addGroupbyRequest(
       cudf::table_view const& tbl,
@@ -488,21 +569,33 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
             input.type() == cudf_velox::veloxToCudfDataType(resultType));
       }
       addDecimalRawPartialSingleSumRequest(
-          input, requests, false, stream, sumIdx_, castedInput_);
+          input, requests, false, false, stream, sumIdx_, castedInput_);
     } else if (step == core::AggregationNode::Step::kIntermediate) {
       addDecimalDecodedSumCountRequests(
           tbl,
           inputIndex,
           resultType,
+          trackOverflow_,
           requests,
           stream,
           sumIdx_,
           countIdx_,
+          overflowIdx_,
           decodedSum_,
-          decodedCount_);
+          decodedCount_,
+          decodedOverflow_);
     } else if (step == core::AggregationNode::Step::kFinal) {
       addDecimalFinalSumOnlyRequest(
-          tbl, inputIndex, resultType, requests, stream, sumIdx_, decodedSum_);
+          tbl,
+          inputIndex,
+          resultType,
+          trackOverflow_,
+          requests,
+          stream,
+          sumIdx_,
+          overflowIdx_,
+          decodedSum_,
+          decodedOverflow_);
     } else {
       // Raw input (kPartial/kSingle): null-inject masked rows so cuDF's
       // null-excluding sum (and the partial count) honor the mask.
@@ -512,6 +605,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
           materializeMaskedInput(tbl, inputIndex, stream, mr),
           requests,
           step == core::AggregationNode::Step::kPartial,
+          trackOverflow_,
           stream,
           sumIdx_,
           castedInput_);
@@ -522,25 +616,35 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    auto col = std::move(results[sumIdx_].results[0]);
     if (compactDecimalState_) {
-      return col;
+      return std::move(results[sumIdx_].results[0]);
     }
+    auto state = takeDecimalSumResult(
+        results, sumIdx_, trackOverflow_, overflowIdx_, stream, mr);
     if (step == core::AggregationNode::Step::kPartial) {
       auto count = std::move(results[sumIdx_].results[1]);
       return serializeDecimalPartialOrIntermediateState(
-          std::move(col), std::move(count), stream, mr);
+          std::move(state.sum),
+          std::move(count),
+          std::move(state.overflow),
+          stream,
+          mr);
     }
     if (step == core::AggregationNode::Step::kIntermediate) {
       auto count = std::move(results[countIdx_].results[0]);
       return serializeDecimalPartialOrIntermediateState(
-          std::move(col), std::move(count), stream, mr);
+          std::move(state.sum),
+          std::move(count),
+          std::move(state.overflow),
+          stream,
+          mr);
     }
-    auto const cudfResType = cudf_velox::veloxToCudfDataType(resultType);
-    if (col->type() != cudfResType) {
-      col = cudf::cast(*col, cudfResType, stream, mr);
-    }
-    return col;
+    return finalizeDecimalSum(
+        std::move(state.sum),
+        std::move(state.overflow),
+        resultType,
+        stream,
+        mr);
   }
 
   void releaseInput() override {
@@ -548,6 +652,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
     castedInput_.reset();
     decodedSum_.reset();
     decodedCount_.reset();
+    decodedOverflow_.reset();
   }
 
   std::unique_ptr<cudf::column> finalize(
@@ -555,8 +660,8 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
-    const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
     if (compactDecimalState_) {
+      const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
       return state->type() == outputType
           ? std::move(state)
           : cudf::cast(*state, outputType, stream, mr);
@@ -564,21 +669,28 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     auto decoded = cudf_velox::deserializeDecimalSumState(
         state->view(), scale, stream, mr);
-    if (decoded.sum->type() != outputType) {
-      return cudf::cast(*decoded.sum, outputType, stream, mr);
-    }
-    return std::move(decoded.sum);
+    return finalizeDecimalSum(
+        std::move(decoded.sum),
+        trackOverflow_ ? std::move(decoded.overflow) : nullptr,
+        resultType,
+        stream,
+        mr);
   }
 
  private:
   uint32_t sumIdx_{0};
   uint32_t countIdx_{0};
+  // Set when the state's overflow is summed in its own request.
+  std::optional<uint32_t> overflowIdx_;
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
+  std::unique_ptr<cudf::column> decodedOverflow_;
   // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
   // alive while the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
   const bool compactDecimalState_;
+  // Long decimal SUM state tracks int128 overflow as the CPU aggregate does.
+  const bool trackOverflow_;
 };
 
 struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
@@ -587,9 +699,11 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       uint32_t inputIndex,
       VectorPtr constant,
       const TypePtr& resultType,
-      bool compactDecimalState)
+      bool compactDecimalState,
+      bool longDecimalInput)
       : GroupbyAggregator(step, inputIndex, constant, resultType, std::nullopt),
-        compactDecimalState_(compactDecimalState) {}
+        compactDecimalState_(compactDecimalState),
+        trackOverflow_(longDecimalInput && !compactDecimalState) {}
 
   // Decimal avg uses a dedicated path that does not honor masks; masked avg
   // already falls back to CPU (see canGroupbyBeEvaluatedByCudf).
@@ -618,18 +732,22 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
           tbl,
           inputIndex,
           resultType,
+          trackOverflow_,
           requests,
           stream,
           sumIdx_,
           countIdx_,
+          overflowIdx_,
           decodedSum_,
-          decodedCount_);
+          decodedCount_,
+          decodedOverflow_);
     } else {
       addDecimalRawPartialSingleSumRequest(
           tbl.column(inputIndex),
           requests,
           step == core::AggregationNode::Step::kPartial ||
               step == core::AggregationNode::Step::kSingle,
+          trackOverflow_,
           stream,
           sumIdx_,
           castedInput_);
@@ -640,14 +758,14 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    auto col = std::move(results[sumIdx_].results[0]);
     if (compactDecimalState_) {
+      auto col = std::move(results[sumIdx_].results[0]);
       auto count = exec::isRawInput(step)
           ? std::move(results[sumIdx_].results[1])
           : std::move(results[countIdx_].results[0]);
       if (!exec::isPartialOutput(step)) {
         return finalizeDecimalAverage(
-            std::move(col), std::move(count), resultType, stream, mr);
+            std::move(col), std::move(count), nullptr, resultType, stream, mr);
       }
       const auto size = col->size();
       std::vector<std::unique_ptr<cudf::column>> children;
@@ -668,28 +786,27 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
           stream,
           mr);
     }
-    if (step == core::AggregationNode::Step::kSingle) {
-      auto count = std::move(results[sumIdx_].results[1]);
-      return finalizeDecimalAverage(
-          std::move(col), std::move(count), resultType, stream, mr);
-    }
-    if (step == core::AggregationNode::Step::kPartial) {
-      auto count = std::move(results[sumIdx_].results[1]);
+    auto state = takeDecimalSumResult(
+        results, sumIdx_, trackOverflow_, overflowIdx_, stream, mr);
+    // Raw input counts in the sum request; state merges sum their counts.
+    auto count = exec::isRawInput(step)
+        ? std::move(results[sumIdx_].results[1])
+        : std::move(results[countIdx_].results[0]);
+    if (exec::isPartialOutput(step)) {
       return serializeDecimalPartialOrIntermediateState(
-          std::move(col), std::move(count), stream, mr);
+          std::move(state.sum),
+          std::move(count),
+          std::move(state.overflow),
+          stream,
+          mr);
     }
-    if (step == core::AggregationNode::Step::kIntermediate) {
-      auto count = std::move(results[countIdx_].results[0]);
-      return serializeDecimalPartialOrIntermediateState(
-          std::move(col), std::move(count), stream, mr);
-    }
-    if (step == core::AggregationNode::Step::kFinal) {
-      auto count = std::move(results[countIdx_].results[0]);
-      return finalizeDecimalAverage(
-          std::move(col), std::move(count), resultType, stream, mr);
-    }
-    // All four aggregation steps are handled above.
-    VELOX_UNREACHABLE();
+    return finalizeDecimalAverage(
+        std::move(state.sum),
+        std::move(count),
+        std::move(state.overflow),
+        resultType,
+        stream,
+        mr);
   }
 
   void releaseInput() override {
@@ -697,6 +814,7 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
     castedInput_.reset();
     decodedSum_.reset();
     decodedCount_.reset();
+    decodedOverflow_.reset();
   }
 
   std::unique_ptr<cudf::column> finalize(
@@ -712,6 +830,7 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       return finalizeDecimalAverage(
           std::move(contents.children[0]),
           std::move(contents.children[1]),
+          nullptr,
           resultType,
           stream,
           mr);
@@ -722,6 +841,7 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
     return finalizeDecimalAverage(
         std::move(decoded.sum),
         std::move(decoded.count),
+        trackOverflow_ ? std::move(decoded.overflow) : nullptr,
         resultType,
         stream,
         mr);
@@ -730,12 +850,17 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
  private:
   uint32_t sumIdx_{0};
   uint32_t countIdx_{0};
+  // Set when the state's overflow is summed in its own request.
+  std::optional<uint32_t> overflowIdx_;
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
+  std::unique_ptr<cudf::column> decodedOverflow_;
   // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
   // alive while the groupby request references its view.
   std::unique_ptr<cudf::column> castedInput_;
   const bool compactDecimalState_;
+  // Long decimal AVG state tracks int128 overflow as the CPU aggregate does.
+  const bool trackOverflow_;
 };
 
 struct GroupbyCountAggregator : GroupbyAggregator {
@@ -1246,7 +1371,8 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
           p.constant,
           p.resultType,
           p.maskIndex,
-          p.compactDecimalState);
+          p.compactDecimalState,
+          p.longDecimalInput);
     }
     return std::make_unique<GroupbySumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -1271,7 +1397,8 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
           p.inputIndex,
           p.constant,
           p.resultType,
-          p.compactDecimalState);
+          p.compactDecimalState,
+          p.longDecimalInput);
     }
     return std::make_unique<GroupbyMeanAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -1300,6 +1427,11 @@ std::unique_ptr<StreamingGroupbyAggregator> createStreamingGroupbyAggregator(
   if (aggregate.isDecimalAggregate) {
     const bool average = aggregate.kind == prefix + "avg";
     if (aggregate.kind != prefix + "sum" && !average) {
+      return nullptr;
+    }
+    // Long decimal state is merged with SUM_OVERFLOW to keep its int128
+    // overflow, and streaming groupby does not support SUM_OVERFLOW.
+    if (aggregate.longDecimalInput) {
       return nullptr;
     }
     const auto scale = getDecimalPrecisionScale(*resultType).second;

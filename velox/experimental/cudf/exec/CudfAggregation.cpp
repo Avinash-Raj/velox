@@ -229,6 +229,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
         : outputType->childAt(numKeys + i);
     const auto isDecimalAggregate = aggregate.rawInputTypes.size() == 1 &&
         aggregate.rawInputTypes[0]->isDecimal();
+    const auto longDecimalInput =
+        isDecimalAggregate && aggregate.rawInputTypes[0]->isLongDecimal();
 
     // Masks apply only at raw-input steps; non-raw steps (kIntermediate/kFinal)
     // gate it off so maskIndex stays nullopt there.
@@ -248,7 +250,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
             : std::nullopt,
         maskIndex,
         isDecimalAggregate,
-        compactDecimalState);
+        compactDecimalState,
+        longDecimalInput);
   }
   return params;
 }

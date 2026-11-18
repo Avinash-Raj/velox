@@ -20,12 +20,17 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/type/DecimalUtil.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/strings/utilities.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <limits>
 
@@ -70,40 +75,28 @@ DecimalSumStateColumns deserializeDecimalSumState(
       "Decimal sum state requires STRING/VARBINARY column (type is {})",
       cudf::type_to_name(stateCol.type()));
   auto numRows = stateCol.size();
-  if (numRows == 0) {
-    DecimalSumStateColumns empty;
-    empty.sum = cudf::make_fixed_width_column(
+  auto makeStateColumns = [&](cudf::mask_state state) {
+    DecimalSumStateColumns columns;
+    columns.sum = cudf::make_fixed_width_column(
         cudf::data_type{cudf::type_id::DECIMAL128, -scale},
-        0,
-        cudf::mask_state::UNALLOCATED,
+        numRows,
+        state,
         stream,
         mr);
-    empty.count = cudf::make_fixed_width_column(
-        cudf::data_type{cudf::type_id::INT64},
-        0,
-        cudf::mask_state::UNALLOCATED,
-        stream,
-        mr);
-    return empty;
+    columns.count = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::INT64}, numRows, state, stream, mr);
+    columns.overflow = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::INT64}, numRows, state, stream, mr);
+    return columns;
+  };
+  if (numRows == 0) {
+    return makeStateColumns(cudf::mask_state::UNALLOCATED);
   }
 
   // For fully-null state columns there is nothing to deserialize. Avoid
   // launching unpack kernels over string payload buffers that may be empty.
   if (stateCol.nullable() && stateCol.null_count() == numRows) {
-    DecimalSumStateColumns allNull;
-    allNull.sum = cudf::make_fixed_width_column(
-        cudf::data_type{cudf::type_id::DECIMAL128, -scale},
-        numRows,
-        cudf::mask_state::ALL_NULL,
-        stream,
-        mr);
-    allNull.count = cudf::make_fixed_width_column(
-        cudf::data_type{cudf::type_id::INT64},
-        numRows,
-        cudf::mask_state::ALL_NULL,
-        stream,
-        mr);
-    return allNull;
+    return makeStateColumns(cudf::mask_state::ALL_NULL);
   }
 
   cudf::strings_column_view strings(stateCol);
@@ -134,53 +127,50 @@ DecimalSumStateColumns deserializeDecimalSumState(
       fullPayloadSize,
       payloadSize);
 
-  auto sumCol = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::DECIMAL128, -scale},
-      numRows,
-      cudf::mask_state::UNALLOCATED,
-      stream,
-      mr);
-  auto countCol = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT64},
-      numRows,
-      cudf::mask_state::UNALLOCATED,
-      stream,
-      mr);
-
-  auto sumView = sumCol->mutable_view();
-  auto countView = countCol->mutable_view();
+  auto result = makeStateColumns(cudf::mask_state::UNALLOCATED);
 
   VELOX_CHECK(
-      detail::unpackDecimalSumState(stateCol, sumView, countView, stream),
+      detail::unpackDecimalSumState(
+          stateCol,
+          result.sum->mutable_view(),
+          result.count->mutable_view(),
+          result.overflow->mutable_view(),
+          stream),
       "Decimal sum state requires every non-null row to be {} bytes and {}-byte aligned",
       detail::kDecimalSumStateSize,
       alignof(int64_t));
 
   if (stateCol.nullable()) {
-    auto nullMask =
-        cudf::copy_bitmask(stateCol, stream, cudf::memory_resources{mr, mr});
     auto nullCount = stateCol.null_count();
-    sumCol->set_null_mask(std::move(nullMask), nullCount);
-    auto countMask =
-        cudf::copy_bitmask(stateCol, stream, cudf::memory_resources{mr, mr});
-    countCol->set_null_mask(std::move(countMask), nullCount);
+    for (auto* column : {&result.sum, &result.count, &result.overflow}) {
+      (*column)->set_null_mask(
+          cudf::copy_bitmask(stateCol, stream, cudf::memory_resources{mr, mr}),
+          nullCount);
+    }
   }
-
-  DecimalSumStateColumns result;
-  result.sum = std::move(sumCol);
-  result.count = std::move(countCol);
   return result;
 }
 
 std::unique_ptr<cudf::column> serializeDecimalSumState(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
+    const cudf::column_view* overflowCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK(
       countCol.type().id() == cudf::type_id::INT64,
       "Decimal sum state requires INT64 count column (type is {})",
       cudf::type_to_name(countCol.type()));
+  if (overflowCol != nullptr) {
+    VELOX_CHECK(
+        overflowCol->type().id() == cudf::type_id::INT64,
+        "Decimal sum state requires INT64 overflow column (type is {})",
+        cudf::type_to_name(overflowCol->type()));
+    VELOX_CHECK_EQ(
+        overflowCol->size(),
+        sumCol.size(),
+        "Decimal sum state requires sum and overflow to be same size");
+  }
   auto numRows = sumCol.size();
   VELOX_CHECK_EQ(
       numRows,
@@ -235,11 +225,15 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
           sumType == cudf::type_id::DECIMAL128,
       "Unsupported decimal sum column type (type is {})",
       cudf::type_to_name(sumCol.type()));
+  VELOX_CHECK(
+      overflowCol == nullptr || sumType == cudf::type_id::DECIMAL128,
+      "Decimal sum state overflow requires a DECIMAL128 sum column");
   detail::packDecimalSumState(
       sumType,
       offsetsType,
       sumCol,
       countCol.data<int64_t>(),
+      overflowCol == nullptr ? nullptr : overflowCol->data<int64_t>(),
       offsetsView,
       charsPtr,
       rowCount,
@@ -258,6 +252,7 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
 std::unique_ptr<cudf::column> computeDecimalAverage(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
+    const cudf::column_view* overflowCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK(
@@ -275,6 +270,18 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
       "Decimal average requires sum and count to be same size (sum size is {}, count size is {})",
       sumCol.size(),
       countCol.size());
+  if (overflowCol != nullptr) {
+    VELOX_CHECK(
+        overflowCol->type().id() == cudf::type_id::INT64 &&
+            sumCol.type().id() == cudf::type_id::DECIMAL128,
+        "Decimal average overflow requires DECIMAL128 sums and INT64 overflow (types are {}, {})",
+        cudf::type_to_name(sumCol.type()),
+        cudf::type_to_name(overflowCol->type()));
+    VELOX_CHECK_EQ(
+        overflowCol->size(),
+        sumCol.size(),
+        "Decimal average requires sum and overflow to be same size");
+  }
 
   auto numRows = sumCol.size();
   auto out = cudf::make_fixed_width_column(
@@ -287,6 +294,7 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
         sumType,
         sumCol,
         countCol.data<int64_t>(),
+        overflowCol == nullptr ? nullptr : overflowCol->data<int64_t>(),
         out->mutable_view(),
         rowCount,
         stream);
@@ -296,6 +304,84 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
       detail::buildStateValidityMask(sumCol, countCol, stream, mr);
   if (nullCount > 0) {
     out->set_null_mask(std::move(nullMask), nullCount);
+  }
+  return out;
+}
+
+DecimalSumStateColumns makeDecimalSumOverflowState(
+    std::unique_ptr<cudf::column> sumOverflow,
+    const cudf::column_view* stateOverflowSum,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(
+      sumOverflow->type().id() == cudf::type_id::STRUCT &&
+          sumOverflow->num_children() == 2,
+      "Decimal SUM_OVERFLOW result must be a STRUCT of sum and overflow (type is {})",
+      cudf::type_to_name(sumOverflow->type()));
+  const auto numRows = sumOverflow->size();
+  // SUM_OVERFLOW marks a group without non-null input null in the parent only,
+  // so its sum child inherits the parent's nulls.
+  auto [sumMask, sumNullCount] = [&] {
+    const auto view = sumOverflow->view();
+    return cudf::bitmask_and(
+        cudf::table_view{{view, view.child(0)}},
+        stream,
+        cudf::memory_resources{mr, get_temp_mr()});
+  }();
+  auto contents = sumOverflow->release();
+  DecimalSumStateColumns state;
+  state.sum = std::move(contents.children[0]);
+  VELOX_CHECK(
+      state.sum->type().id() == cudf::type_id::DECIMAL128,
+      "Decimal SUM_OVERFLOW requires a DECIMAL128 sum (type is {})",
+      cudf::type_to_name(state.sum->type()));
+  state.sum->set_null_mask(std::move(sumMask), sumNullCount);
+  state.overflow = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64},
+      numRows,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  detail::assembleDecimalSumOverflow(
+      state.sum->mutable_view(),
+      contents.children[1]->view(),
+      stateOverflowSum,
+      state.overflow->mutable_view(),
+      stream);
+  return state;
+}
+
+std::unique_ptr<cudf::column> adjustDecimalSumForOverflow(
+    const cudf::column_view& sumCol,
+    const cudf::column_view& overflowCol,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto out = cudf::make_fixed_width_column(
+      sumCol.type(), sumCol.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  const auto invalidRow = detail::adjustDecimalSumForOverflow(
+      sumCol, overflowCol, out->mutable_view(), stream);
+  if (invalidRow >= 0) {
+    const auto sumScalar =
+        cudf::get_element(sumCol, invalidRow, stream, get_temp_mr());
+    const auto overflowScalar =
+        cudf::get_element(overflowCol, invalidRow, stream, get_temp_mr());
+    const auto sum =
+        static_cast<const cudf::fixed_point_scalar<numeric::decimal128>&>(
+            *sumScalar)
+            .value(stream);
+    const auto overflow =
+        static_cast<const cudf::numeric_scalar<int64_t>&>(*overflowScalar)
+            .value(stream);
+    // Raise the CPU DecimalSumAggregate error for the offending row.
+    const auto adjusted = DecimalUtil::adjustSumForOverflow(sum, overflow);
+    VELOX_USER_CHECK(adjusted.has_value(), "Decimal overflow");
+    DecimalUtil::valueInRange(adjusted.value());
+    VELOX_UNREACHABLE();
+  }
+  if (sumCol.nullable()) {
+    out->set_null_mask(
+        cudf::copy_bitmask(sumCol, stream, cudf::memory_resources{mr, mr}),
+        sumCol.null_count());
   }
   return out;
 }

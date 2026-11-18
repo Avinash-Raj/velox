@@ -68,13 +68,15 @@ std::unique_ptr<cudf::column> castCountColumnToInt64(
     cuda::stream_ref stream);
 
 /**
- * Normalizes the count column to INT64, then encodes sum and count into a
- * single STRING column of fixed-width per-row payloads (delegates to
+ * Normalizes the count column to INT64, then encodes sum, count and overflow
+ * into a single STRING column of fixed-width per-row payloads (delegates to
  * serializeDecimalSumState). Used when emitting or persisting partial /
  * intermediate decimal SUM state for the cuDF path.
  *
  * @param sum partial sum column (DECIMAL64 or DECIMAL128).
  * @param count partial-row count column.
+ * @param overflow INT64 net int128 overflow column, or nullptr when the sum
+ *        cannot overflow.
  * @param stream CUDA stream for device work.
  * @param mr memory resource for allocated columns.
  * @return STRING column of serialized state.
@@ -82,17 +84,20 @@ std::unique_ptr<cudf::column> castCountColumnToInt64(
 std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
 /**
  * Normalizes the count column to INT64, computes a per-row decimal average
- * from intermediate sum/count (delegates to computeDecimalAverage), then casts
- * the result to the Velox result type when its cuDF decimal encoding differs
- * from the average column's type.
+ * from intermediate sum/count/overflow (delegates to computeDecimalAverage),
+ * then casts the result to the Velox result type when its cuDF decimal
+ * encoding differs from the average column's type.
  *
  * @param sum intermediate sum column (DECIMAL64 or DECIMAL128).
  * @param count intermediate count column.
+ * @param overflow INT64 net int128 overflow column, or nullptr when the sum
+ *        cannot overflow.
  * @param resultType Velox type of the finalized average.
  * @param stream CUDA stream for device work.
  * @param mr memory resource for allocated columns.
@@ -101,6 +106,28 @@ std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/**
+ * Finalizes decimal SUM: when 'overflow' is set, folds it into the sum and
+ * raises the CPU "Decimal overflow" error for a sum outside DECIMAL(38) (see
+ * adjustDecimalSumForOverflow), then casts to the Velox result type when the
+ * cuDF decimal encoding differs.
+ *
+ * @param sum sum column (DECIMAL64 or DECIMAL128).
+ * @param overflow INT64 net int128 overflow column, or nullptr when the sum
+ *        cannot overflow.
+ * @param resultType Velox type of the finalized sum.
+ * @param stream CUDA stream for device work.
+ * @param mr memory resource for allocated columns.
+ * @return finalized sum column.
+ */
+std::unique_ptr<cudf::column> finalizeDecimalSum(
+    std::unique_ptr<cudf::column> sum,
+    std::unique_ptr<cudf::column> overflow,
     const TypePtr& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);

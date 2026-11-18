@@ -64,25 +64,56 @@ std::unique_ptr<cudf::column> castCountColumnToInt64(
 std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   count = castCountColumnToInt64(std::move(count), stream);
-  return serializeDecimalSumState(sum->view(), count->view(), stream, mr);
+  const auto overflowView = overflow ? overflow->view() : cudf::column_view{};
+  return serializeDecimalSumState(
+      sum->view(),
+      count->view(),
+      overflow ? &overflowView : nullptr,
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
     const TypePtr& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   count = castCountColumnToInt64(std::move(count), stream);
-  auto avgCol = computeDecimalAverage(sum->view(), count->view(), stream, mr);
+  const auto overflowView = overflow ? overflow->view() : cudf::column_view{};
+  auto avgCol = computeDecimalAverage(
+      sum->view(),
+      count->view(),
+      overflow ? &overflowView : nullptr,
+      stream,
+      mr);
   auto const cudfOutType = veloxToCudfDataType(resultType);
   if (avgCol->type() != cudfOutType) {
     avgCol = cudf::cast(avgCol->view(), cudfOutType, stream, mr);
   }
   return avgCol;
+}
+
+std::unique_ptr<cudf::column> finalizeDecimalSum(
+    std::unique_ptr<cudf::column> sum,
+    std::unique_ptr<cudf::column> overflow,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (overflow) {
+    sum =
+        adjustDecimalSumForOverflow(sum->view(), overflow->view(), stream, mr);
+  }
+  auto const cudfOutType = veloxToCudfDataType(resultType);
+  if (sum->type() != cudfOutType) {
+    sum = cudf::cast(sum->view(), cudfOutType, stream, mr);
+  }
+  return sum;
 }
 
 } // namespace facebook::velox::cudf_velox

@@ -49,6 +49,7 @@ namespace {
 using namespace facebook::velox;
 using facebook::velox::cudf_velox::CountInputKind;
 using facebook::velox::cudf_velox::finalizeDecimalAverage;
+using facebook::velox::cudf_velox::finalizeDecimalSum;
 using facebook::velox::cudf_velox::get_output_mr;
 using facebook::velox::cudf_velox::get_temp_mr;
 using facebook::velox::cudf_velox::ReduceAggregator;
@@ -289,28 +290,65 @@ struct ReduceMeanAggregator : ReduceAggregator {
   }
 };
 
-// Materializes reduced sum/count scalars into 1-row columns.
-cudf_velox::DecimalSumStateColumns makeSumCountColumns(
-    cudf::scalar const& sumScalar,
-    cudf::scalar const& countScalar,
+// Reduces DECIMAL128 sums into one row of decimal SUM state. Long decimal sums
+// use SUM_OVERFLOW, which reports the int128 wraps that a plain SUM drops, and
+// add the merged states' overflow when 'stateOverflow' is set, so the state
+// carries the overflow like the CPU aggregate does.
+cudf_velox::DecimalSumStateColumns reduceDecimal128Sum(
+    cudf::column_view values,
+    bool trackOverflow,
+    const cudf::column_view* stateOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  cudf_velox::DecimalSumStateColumns cols;
-  cols.sum = cudf::make_column_from_scalar(sumScalar, 1, stream, mr);
-  cols.count = cudf::make_column_from_scalar(countScalar, 1, stream, mr);
-  return cols;
+  if (!trackOverflow) {
+    auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+    auto const sumScalar =
+        cudf::reduce(values, *sumAgg, values.type(), stream, get_temp_mr());
+    cudf_velox::DecimalSumStateColumns state;
+    state.sum = cudf::make_column_from_scalar(*sumScalar, 1, stream, mr);
+    return state;
+  }
+  auto const sumOverflowAgg =
+      cudf::make_sum_overflow_aggregation<cudf::reduce_aggregation>(
+          cudf::sum_overflow_output::COUNT);
+  auto const sumOverflowScalar = cudf::reduce(
+      values,
+      *sumOverflowAgg,
+      cudf::data_type{cudf::type_id::STRUCT},
+      stream,
+      get_temp_mr());
+  std::unique_ptr<cudf::column> overflowSum;
+  if (stateOverflow != nullptr) {
+    auto const overflowAgg =
+        cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+    auto const overflowScalar = cudf::reduce(
+        *stateOverflow,
+        *overflowAgg,
+        cudf::data_type{cudf::type_id::INT64},
+        stream,
+        get_temp_mr());
+    overflowSum = cudf::make_column_from_scalar(
+        *overflowScalar, 1, stream, get_temp_mr());
+  }
+  const auto overflowSumView =
+      overflowSum ? overflowSum->view() : cudf::column_view{};
+  return cudf_velox::makeDecimalSumOverflowState(
+      cudf::make_column_from_scalar(*sumOverflowScalar, 1, stream, mr),
+      overflowSum ? &overflowSumView : nullptr,
+      stream,
+      mr);
 }
 
 cudf_velox::DecimalSumStateColumns reduceRawDecimalSumCount(
     cudf::column_view inputCol,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   if (inputCol.type().id() == cudf::type_id::DECIMAL64) {
     return cudf_velox::reduceDecimal64SumCount(inputCol, stream, mr);
   }
-  auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-  auto sumScalar =
-      cudf::reduce(inputCol, *sumAgg, inputCol.type(), stream, get_temp_mr());
+  auto state =
+      reduceDecimal128Sum(inputCol, trackOverflow, nullptr, stream, mr);
   auto countAgg = cudf::make_count_aggregation<cudf::reduce_aggregation>(
       cudf::null_policy::EXCLUDE);
   auto countScalar = cudf::reduce(
@@ -319,84 +357,119 @@ cudf_velox::DecimalSumStateColumns reduceRawDecimalSumCount(
       cudf::data_type{cudf::type_id::INT64},
       stream,
       get_temp_mr());
-  return makeSumCountColumns(*sumScalar, *countScalar, stream, mr);
+  state.count = cudf::make_column_from_scalar(*countScalar, 1, stream, mr);
+  return state;
 }
 
 std::unique_ptr<cudf::column> partialDecimalSumCountToSerializedString(
     cudf::column_view inputCol,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto cols = reduceRawDecimalSumCount(inputCol, stream, mr);
+  auto cols = reduceRawDecimalSumCount(inputCol, trackOverflow, stream, mr);
   return serializeDecimalPartialOrIntermediateState(
-      std::move(cols.sum), std::move(cols.count), stream, mr);
+      std::move(cols.sum),
+      std::move(cols.count),
+      std::move(cols.overflow),
+      stream,
+      mr);
 }
 
-// Decodes serialized decimal SUM state, sums the per-row partial sums and
-// counts, and returns them as 1-row columns. Shared by the intermediate and
-// final reduce steps before re-serializing or finalizing. The merged columns
-// are consumed by the caller and never leave the operator, so they come from
-// the temporary memory resource.
+// Decodes serialized decimal SUM state, sums the per-row partial sums, counts
+// and (when tracked) overflow, and returns them as 1-row columns. Shared by the
+// intermediate and final reduce steps before re-serializing or finalizing. The
+// merged columns are consumed by the caller and never leave the operator, so
+// they come from the temporary memory resource.
 cudf_velox::DecimalSumStateColumns mergeSerializedDecimalSumState(
     cudf::column_view inputCol,
     int32_t scale,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-  auto sumAndCount = cudf_velox::deserializeDecimalSumState(
+  auto decoded = cudf_velox::deserializeDecimalSumState(
       inputCol, scale, stream, get_temp_mr());
-  auto sumScalar = cudf::reduce(
-      sumAndCount.sum->view(),
-      *sumAgg,
-      sumAndCount.sum->view().type(),
-      stream,
-      mr);
+  const auto decodedOverflow = decoded.overflow->view();
+  auto merged = reduceDecimal128Sum(
+      decoded.sum->view(), trackOverflow, &decodedOverflow, stream, mr);
+  auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
   auto countScalar = cudf::reduce(
-      sumAndCount.count->view(),
+      decoded.count->view(),
       *sumAgg,
       cudf::data_type{cudf::type_id::INT64},
       stream,
       mr);
-  return makeSumCountColumns(*sumScalar, *countScalar, stream, mr);
+  merged.count = cudf::make_column_from_scalar(*countScalar, 1, stream, mr);
+  return merged;
 }
 
 std::unique_ptr<cudf::column> intermediateDecimalMergeSerializedString(
     cudf::column_view inputCol,
     int32_t scale,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto merged = mergeSerializedDecimalSumState(inputCol, scale, stream, mr);
+  auto merged = mergeSerializedDecimalSumState(
+      inputCol, scale, trackOverflow, stream, mr);
   return serializeDecimalPartialOrIntermediateState(
-      std::move(merged.sum), std::move(merged.count), stream, mr);
+      std::move(merged.sum),
+      std::move(merged.count),
+      std::move(merged.overflow),
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> finalDecimalAvgFromSerializedString(
     cudf::column_view inputCol,
     int32_t scale,
+    bool trackOverflow,
     TypePtr const& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto merged = mergeSerializedDecimalSumState(inputCol, scale, stream, mr);
+  auto merged = mergeSerializedDecimalSumState(
+      inputCol, scale, trackOverflow, stream, mr);
   return finalizeDecimalAverage(
-      std::move(merged.sum), std::move(merged.count), resultType, stream, mr);
+      std::move(merged.sum),
+      std::move(merged.count),
+      std::move(merged.overflow),
+      resultType,
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> singleDecimalAvgFromRawColumn(
     cudf::column_view inputCol,
+    bool trackOverflow,
     TypePtr const& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto cols = reduceRawDecimalSumCount(inputCol, stream, mr);
+  auto cols = reduceRawDecimalSumCount(inputCol, trackOverflow, stream, mr);
   return finalizeDecimalAverage(
-      std::move(cols.sum), std::move(cols.count), resultType, stream, mr);
+      std::move(cols.sum),
+      std::move(cols.count),
+      std::move(cols.overflow),
+      resultType,
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> singleOrRawDecimalSumWithCast(
     cudf::column_view inputCol,
     TypePtr const& outputType,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   if (inputCol.type().id() == cudf::type_id::DECIMAL64) {
     return cudf_velox::reduceDecimal64SumCount(inputCol, stream, mr).sum;
+  }
+  if (trackOverflow) {
+    auto state =
+        reduceDecimal128Sum(inputCol, true, nullptr, stream, get_temp_mr());
+    return finalizeDecimalSum(
+        std::move(state.sum),
+        std::move(state.overflow),
+        outputType,
+        stream,
+        mr);
   }
   auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
   auto const cudfOutType = cudf_velox::veloxToCudfDataType(outputType);
@@ -408,6 +481,7 @@ std::unique_ptr<cudf::column> singleOrRawDecimalSumWithCast(
 std::unique_ptr<cudf::column> reduceIntermediateDecimalFromSerializedColumn(
     cudf::column_view inputCol,
     TypePtr const& outputType,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   validateIntermediateColumnType(inputCol);
@@ -415,31 +489,45 @@ std::unique_ptr<cudf::column> reduceIntermediateDecimalFromSerializedColumn(
   auto scale = outputType->isDecimal()
       ? getDecimalPrecisionScale(*outputType).second
       : 0;
-  return intermediateDecimalMergeSerializedString(inputCol, scale, stream, mr);
+  return intermediateDecimalMergeSerializedString(
+      inputCol, scale, trackOverflow, stream, mr);
 }
 
 std::unique_ptr<cudf::column> reduceFinalDecimalSumFromSerializedColumn(
     cudf::column_view inputCol,
     TypePtr const& outputType,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   validateIntermediateColumnType(inputCol);
   auto scale = getDecimalPrecisionScale(*outputType).second;
-  auto sumAndCount = cudf_velox::deserializeDecimalSumState(
+  auto decoded = cudf_velox::deserializeDecimalSumState(
       inputCol, scale, stream, get_temp_mr());
-  return singleOrRawDecimalSumWithCast(
-      sumAndCount.sum->view(), outputType, stream, mr);
+  if (!trackOverflow) {
+    return singleOrRawDecimalSumWithCast(
+        decoded.sum->view(), outputType, false, stream, mr);
+  }
+  const auto decodedOverflow = decoded.overflow->view();
+  auto merged = reduceDecimal128Sum(
+      decoded.sum->view(), true, &decodedOverflow, stream, get_temp_mr());
+  return finalizeDecimalSum(
+      std::move(merged.sum),
+      std::move(merged.overflow),
+      outputType,
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> reduceFinalDecimalAvgFromSerializedColumn(
     cudf::column_view inputCol,
     TypePtr const& outputType,
+    bool trackOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   validateIntermediateColumnType(inputCol);
   auto scale = getDecimalPrecisionScale(*outputType).second;
   return finalDecimalAvgFromSerializedString(
-      inputCol, scale, outputType, stream, mr);
+      inputCol, scale, trackOverflow, outputType, stream, mr);
 }
 
 // Decimal SUM and AVG use dedicated aggregators rather than cudf::reduce's
@@ -453,9 +541,11 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
       VectorPtr constant,
       const TypePtr& resultType,
       std::optional<uint32_t> maskIndex,
-      bool compactDecimalSum)
+      bool compactDecimalSum,
+      bool longDecimalInput)
       : ReduceAggregator(step, inputIndex, constant, resultType, maskIndex),
-        compactDecimalSum_(compactDecimalSum) {}
+        compactDecimalSum_(compactDecimalSum),
+        trackOverflow_(longDecimalInput && !compactDecimalSum) {}
 
   std::unique_ptr<cudf::column> doReduce(
       cudf::table_view const& input,
@@ -475,19 +565,22 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
         VELOX_CHECK(
             inputCol.type() == cudf_velox::veloxToCudfDataType(outputType));
       }
-      return singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
+      return singleOrRawDecimalSumWithCast(
+          inputCol, outputType, false, stream, mr);
     }
     switch (step) {
       case core::AggregationNode::Step::kSingle:
-        return singleOrRawDecimalSumWithCast(inputCol, outputType, stream, mr);
+        return singleOrRawDecimalSumWithCast(
+            inputCol, outputType, trackOverflow_, stream, mr);
       case core::AggregationNode::Step::kPartial:
-        return partialDecimalSumCountToSerializedString(inputCol, stream, mr);
+        return partialDecimalSumCountToSerializedString(
+            inputCol, trackOverflow_, stream, mr);
       case core::AggregationNode::Step::kIntermediate:
         return reduceIntermediateDecimalFromSerializedColumn(
-            inputCol, outputType, stream, mr);
+            inputCol, outputType, trackOverflow_, stream, mr);
       case core::AggregationNode::Step::kFinal:
         return reduceFinalDecimalSumFromSerializedColumn(
-            inputCol, outputType, stream, mr);
+            inputCol, outputType, trackOverflow_, stream, mr);
       default:
         VELOX_NYI("Unsupported aggregation step for decimal sum reduce");
     }
@@ -495,6 +588,8 @@ struct ReduceDecimalSumAggregator : ReduceAggregator {
 
  private:
   const bool compactDecimalSum_;
+  // Long decimal SUM state tracks int128 overflow as the CPU aggregate does.
+  const bool trackOverflow_;
 };
 
 struct ReduceDecimalAvgAggregator : ReduceAggregator {
@@ -502,9 +597,10 @@ struct ReduceDecimalAvgAggregator : ReduceAggregator {
       core::AggregationNode::Step step,
       uint32_t inputIndex,
       VectorPtr constant,
-      const TypePtr& resultType)
-      : ReduceAggregator(step, inputIndex, constant, resultType, std::nullopt) {
-  }
+      const TypePtr& resultType,
+      bool longDecimalInput)
+      : ReduceAggregator(step, inputIndex, constant, resultType, std::nullopt),
+        trackOverflow_(longDecimalInput) {}
 
   std::unique_ptr<cudf::column> doReduce(
       cudf::table_view const& input,
@@ -518,21 +614,27 @@ struct ReduceDecimalAvgAggregator : ReduceAggregator {
     cudf::column_view inputCol = input.column(inputIndex);
     switch (step) {
       case core::AggregationNode::Step::kSingle:
-        return singleDecimalAvgFromRawColumn(inputCol, resultType, stream, mr);
+        return singleDecimalAvgFromRawColumn(
+            inputCol, trackOverflow_, resultType, stream, mr);
       case core::AggregationNode::Step::kPartial:
-        return partialDecimalSumCountToSerializedString(inputCol, stream, mr);
+        return partialDecimalSumCountToSerializedString(
+            inputCol, trackOverflow_, stream, mr);
       case core::AggregationNode::Step::kIntermediate:
         return reduceIntermediateDecimalFromSerializedColumn(
-            inputCol, outputType, stream, mr);
+            inputCol, outputType, trackOverflow_, stream, mr);
       case core::AggregationNode::Step::kFinal:
         VELOX_CHECK(
             *outputType == *resultType, "outputType/resultType mismatch");
         return reduceFinalDecimalAvgFromSerializedColumn(
-            inputCol, outputType, stream, mr);
+            inputCol, outputType, trackOverflow_, stream, mr);
       default:
         VELOX_NYI("Unsupported aggregation step for decimal avg reduce");
     }
   }
+
+ private:
+  // Long decimal AVG state tracks int128 overflow as the CPU aggregate does.
+  const bool trackOverflow_;
 };
 
 struct ApproxDistinctAggregator : ReduceAggregator {
@@ -758,7 +860,8 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
           p.constant,
           p.resultType,
           p.maskIndex,
-          p.compactDecimalState);
+          p.compactDecimalState,
+          p.longDecimalInput);
     }
     return std::make_unique<ReduceSumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -779,7 +882,11 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
   } else if (kind.rfind(prefix + "avg", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<ReduceDecimalAvgAggregator>(
-          p.companionStep, p.inputIndex, p.constant, p.resultType);
+          p.companionStep,
+          p.inputIndex,
+          p.constant,
+          p.resultType,
+          p.longDecimalInput);
     }
     return std::make_unique<ReduceMeanAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
