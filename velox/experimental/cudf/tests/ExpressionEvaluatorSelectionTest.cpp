@@ -124,8 +124,7 @@ TEST_F(CudfExpressionSelectionTest, logicalFunctionVariantConstants) {
         ASSERT_EQ(scalar->is_valid(stream), expected[left][right].has_value());
         if (expected[left][right].has_value()) {
           EXPECT_EQ(
-              static_cast<cudf::fixed_width_scalar<bool>&>(*scalar).value(
-                  stream),
+              static_cast<cudf::numeric_scalar<bool>&>(*scalar).value(stream),
               *expected[left][right]);
         }
       }
