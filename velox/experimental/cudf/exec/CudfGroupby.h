@@ -108,6 +108,32 @@ struct GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
+  // Type of the state kept between batches of incremental groupby when it
+  // differs from the declared intermediate type, else nullptr. Partial and
+  // intermediate steps then output this state, and every step accepts it as
+  // input alongside the declared intermediate type.
+  virtual TypePtr bufferedStateType() const {
+    return nullptr;
+  }
+
+  // Converts a column of the declared intermediate type to the buffered state.
+  // Only called when bufferedStateType() is set.
+  virtual std::unique_ptr<cudf::column> toBufferedState(
+      cudf::column_view /*state*/,
+      cuda::stream_ref /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) {
+    VELOX_UNREACHABLE();
+  }
+
+  // Converts a buffered state column to the declared intermediate type.
+  // Only called when bufferedStateType() is set.
+  virtual std::unique_ptr<cudf::column> fromBufferedState(
+      std::unique_ptr<cudf::column> /*state*/,
+      cuda::stream_ref /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) {
+    VELOX_UNREACHABLE();
+  }
+
   virtual ~GroupbyAggregator() = default;
 
  protected:
@@ -141,13 +167,16 @@ struct GroupbyAggregator {
 // Factory functions for creating groupby aggregators from plan nodes.
 // 'maskChannels' carries the post-permutation mask column index per aggregate;
 // pass the raw-input mask channels for raw base/partial steps and an empty
-// vector for intermediate/final steps.
+// vector for intermediate/final steps. 'bufferedState' lets aggregators keep a
+// cheaper state than the declared intermediate type between batches of
+// incremental groupby (see GroupbyAggregator::bufferedStateType()).
 std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
-    std::vector<std::optional<uint32_t>> const& maskChannels);
+    std::vector<std::optional<uint32_t>> const& maskChannels,
+    bool bufferedState = false);
 
 std::optional<std::vector<std::unique_ptr<StreamingGroupbyAggregator>>>
 toStreamingGroupbyAggregators(
@@ -214,6 +243,10 @@ class CudfGroupby : public CudfOperatorBase {
 
   CudfVectorPtr releaseAndResetBufferedResult();
 
+  // Replaces each aggregate column in 'bufferedResult_' that holds a buffered
+  // state with its declared intermediate type and returns it as 'outputType_'.
+  CudfVectorPtr bufferedResultToIntermediate(CudfVectorPtr bufferedResult);
+
   bool initializeStreamingGroupby(
       const RowTypePtr& inputRowSchema,
       const std::vector<VectorPtr>& constants,
@@ -262,6 +295,9 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+  // Some aggregate columns of 'bufferedResult_' hold a buffered state that
+  // differs from the declared intermediate type.
+  bool hasBufferedState_{false};
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;

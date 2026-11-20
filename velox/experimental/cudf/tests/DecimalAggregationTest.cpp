@@ -1497,6 +1497,164 @@ TEST_F(CudfDecimalTest, longDecimalAvgOverflow) {
   }
 }
 
+// Incremental groupby merges long decimal states of successive batches as a
+// struct. Every batch wraps int128, the partial step either merges all batches
+// before flushing or flushes each one, and the sum keeps the input scale.
+TEST_F(CudfDecimalTest, longDecimalBufferedStateAcrossBatches) {
+  const auto type = DECIMAL(38, 2);
+  const auto makeBatch = [&](std::vector<int128_t> values) {
+    return makeRowVector(
+        {"k", "d"},
+        {makeFlatVector<int32_t>({1, 1, 2, 2}),
+         makeFlatVector<int128_t>(values, type)});
+  };
+  const auto up = makeBatch(
+      {kLongDecimalMax, kLongDecimalMax, -kLongDecimalMax, -kLongDecimalMax});
+  const auto down = makeBatch(
+      {-kLongDecimalMax, -kLongDecimalMax, kLongDecimalMax, kLongDecimalMax});
+  const auto last = makeBatch({5, 4, -7, -2});
+  // Group 1 sums to 9 over 10 rows and group 2 to -9.
+  auto expected = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int128_t>({9, -9}, type),
+       makeFlatVector<int128_t>({1, -1}, type)});
+  for (const auto* maxPartialMemory : {"1", "1000000"}) {
+    SCOPED_TRACE(maxPartialMemory);
+    for (const auto& plan : makeAggregationPlans(
+             {up, down, up, down, last}, {"k"}, {"sum(d)", "avg(d)"})) {
+      exec::test::AssertQueryBuilder(plan)
+          .maxDrivers(1)
+          .config(CudfFromVelox::kGpuBatchSizeRows, 4)
+          .config(
+              core::QueryConfig::kMaxPartialAggregationMemory, maxPartialMemory)
+          .assertResults(expected);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, longDecimalBufferedStateConversions) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {makeFlatVector<int32_t>({1}),
+       makeFlatVector<int128_t>({1}, DECIMAL(38, 2))});
+  auto plan = exec::test::PlanBuilder()
+                  .values({input})
+                  .partialAggregation({"k"}, {"sum(d)", "avg(d)"})
+                  .finalAggregation()
+                  .planNode();
+  auto final = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  ASSERT_NE(final, nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+
+  // Exact sums are 5 and -7; the last state has no input.
+  constexpr auto kInt128Min = std::numeric_limits<int128_t>::min();
+  constexpr auto kInt128Max = std::numeric_limits<int128_t>::max();
+  const std::vector<int128_t> sums{kInt128Min + 5, kInt128Max - 6, 0};
+  const std::vector<int64_t> counts{2, 3, 0};
+  const std::vector<int64_t> overflows{1, -1, 0};
+  auto sumCol = makeDecimalColumn<int128_t>(sums, 0, nullptr, stream);
+  auto countCol = makeInt64Column(counts, nullptr, stream);
+  auto overflowCol = makeInt64Column(overflows, nullptr, stream);
+  const auto overflowView = overflowCol->view();
+  auto encoded = serializeDecimalSumState(
+      sumCol->view(), countCol->view(), &overflowView, stream, mr);
+  ASSERT_EQ(encoded->null_count(), 1);
+
+  const std::vector<VectorPtr> constants(2);
+  auto intermediate = toGroupbyAggregators(
+      *final,
+      core::AggregationNode::Step::kIntermediate,
+      final->outputType(),
+      constants,
+      {},
+      true);
+  ASSERT_EQ(intermediate.size(), 2);
+  for (const auto& aggregator : intermediate) {
+    ASSERT_NE(aggregator->bufferedStateType(), nullptr);
+    EXPECT_EQ(
+        aggregator->bufferedStateType()->toString(),
+        "ROW<sum:DECIMAL(38, 0),count:BIGINT,overflow:BIGINT>");
+  }
+  auto withoutBuffering = toGroupbyAggregators(
+      *final,
+      core::AggregationNode::Step::kIntermediate,
+      final->outputType(),
+      constants,
+      {});
+  EXPECT_EQ(withoutBuffering[0]->bufferedStateType(), nullptr);
+
+  auto buffered = intermediate[0]->toBufferedState(encoded->view(), stream, mr);
+  ASSERT_EQ(buffered->type().id(), cudf::type_id::STRUCT);
+  ASSERT_EQ(buffered->num_children(), 3);
+  EXPECT_EQ(buffered->null_count(), 0);
+  const auto sum = buffered->view().child(0);
+  EXPECT_EQ(sum.type(), cudf::data_type(cudf::type_id::DECIMAL128, 0));
+  const auto bufferedSums = copyColumnData<int128_t>(sum, stream);
+  EXPECT_EQ(bufferedSums[0], sums[0]);
+  EXPECT_EQ(bufferedSums[1], sums[1]);
+  EXPECT_FALSE(isValidAt(copyNullMask(sum, stream), 2));
+  const auto bufferedCounts =
+      copyColumnData<int64_t>(buffered->view().child(1), stream);
+  EXPECT_EQ(bufferedCounts[0], 2);
+  EXPECT_EQ(bufferedCounts[1], 3);
+  const auto bufferedOverflows =
+      copyColumnData<int64_t>(buffered->view().child(2), stream);
+  EXPECT_EQ(bufferedOverflows[0], 1);
+  EXPECT_EQ(bufferedOverflows[1], -1);
+
+  auto keys = makeFixedWidthColumn<int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, {1, 2, 3}, nullptr, stream);
+  cudf::table_view table({keys->view(), buffered->view(), buffered->view()});
+  for (const auto& aggregator : intermediate) {
+    std::vector<cudf::groupby::aggregation_request> requests;
+    aggregator->addGroupbyRequest(table, requests, stream, mr);
+    ASSERT_EQ(requests.size(), 3);
+    EXPECT_EQ(requests[0].values.type(), sum.type());
+    aggregator->releaseInput();
+  }
+
+  // The VARBINARY state round-trips through the buffered state.
+  auto reencoded = intermediate[0]->fromBufferedState(
+      std::make_unique<cudf::column>(buffered->view(), stream, mr), stream, mr);
+  auto decoded = deserializeDecimalSumState(reencoded->view(), 0, stream, mr);
+  const auto decodedSums =
+      copyColumnData<int128_t>(decoded.sum->view(), stream);
+  EXPECT_EQ(decodedSums[0], sums[0]);
+  EXPECT_EQ(decodedSums[1], sums[1]);
+  EXPECT_EQ(decoded.sum->null_count(), 1);
+  const auto decodedOverflows =
+      copyColumnData<int64_t>(decoded.overflow->view(), stream);
+  EXPECT_EQ(decodedOverflows[0], 1);
+  EXPECT_EQ(decodedOverflows[1], -1);
+
+  // Finalization folds the overflow in and restores the result scale.
+  auto finals = toGroupbyAggregators(
+      *final, final->step(), final->outputType(), constants, {}, true);
+  ASSERT_EQ(finals.size(), 2);
+  const auto checkResult = [&](const cudf::column_view& result,
+                               const std::vector<int128_t>& expected) {
+    EXPECT_EQ(result.type(), cudf::data_type(cudf::type_id::DECIMAL128, -2));
+    ASSERT_EQ(result.size(), 3);
+    const auto values = copyColumnData<int128_t>(result, stream);
+    EXPECT_EQ(values[0], expected[0]);
+    EXPECT_EQ(values[1], expected[1]);
+    EXPECT_EQ(result.null_count(), 1);
+    EXPECT_FALSE(isValidAt(copyNullMask(result, stream), 2));
+  };
+  auto finalSum = finals[0]->finalize(
+      std::make_unique<cudf::column>(buffered->view(), stream, mr), stream, mr);
+  checkResult(finalSum->view(), {5, -7});
+  // AVG matches finalizing the VARBINARY state.
+  auto encodedAvg = finals[1]->finalize(
+      std::make_unique<cudf::column>(encoded->view(), stream, mr), stream, mr);
+  const auto encodedAvgValues =
+      copyColumnData<int128_t>(encodedAvg->view(), stream);
+  auto finalAvg = finals[1]->finalize(std::move(buffered), stream, mr);
+  checkResult(finalAvg->view(), {encodedAvgValues[0], encodedAvgValues[1]});
+  EXPECT_EQ(encodedAvgValues[1], -2);
+}
+
 // GPU and CPU partial states hold the same overflow, so either side can
 // finalize the other's state.
 TEST_F(CudfDecimalTest, longDecimalSumOverflowStateMatchesCpu) {
