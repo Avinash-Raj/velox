@@ -1837,12 +1837,13 @@ TEST_F(CudfDecimalTest, streamingCompactSumThroughLocalExchange) {
                   .config(CudfFromVelox::kGpuBatchSizeRows, 6)
                   .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
                   .assertResults(expected);
+  // The long decimal sum(c2) is merged with SUM_OVERFLOW, which streaming
+  // groupby supports only after cuDF R2, so the node falls back to incremental
+  // groupby.
   const auto stats = exec::toPlanStats(task->taskStats());
-  EXPECT_GT(
-      stats.at(plan->id())
-          .customStats.at(std::string{kStreamingGroupbyUsedStat})
-          .sum,
-      0);
+  const auto& customStats = stats.at(plan->id()).customStats;
+  EXPECT_EQ(customStats.count(std::string{kStreamingGroupbyUsedStat}), 0);
+  EXPECT_GT(customStats.at(std::string{kDirectGroupbyFinalizationStat}).sum, 0);
 }
 
 TEST_F(CudfDecimalTest, compactAvgGroupedBatches) {
