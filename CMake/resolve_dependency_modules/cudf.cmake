@@ -53,14 +53,15 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# Slot-table streaming groupby with lookup-only aggregation for segmented state.
+# Slot-table streaming groupby with lookup-only aggregation for segmented state,
+# plus SUM_OVERFLOW with sum_overflow_output::COUNT (NVIDIA/cudf#25139).
 set(VELOX_cudf_VERSION 26.12 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT c47fd06c1211dec3591ba50c1520f1f19c465b59)
+set(VELOX_cudf_COMMIT 392ecd52dea95a1763875643d2be3ce26b837629)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  032337d950b172f94d4653b1a4277ae7ca49eccc62345632303ce66856974c91
+  3ef76fa37a724580328ef01f159562f958f94568f5a0ebf318bc44d19005996f
 )
-set(VELOX_cudf_SOURCE_URL "https://github.com/shrshi/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+set(VELOX_cudf_SOURCE_URL "https://github.com/Avinash-Raj/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install, to pick the default for
