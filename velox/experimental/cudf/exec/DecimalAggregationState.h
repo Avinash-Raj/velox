@@ -21,6 +21,7 @@
 #include <cuda/stream>
 
 #include <memory>
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
 
@@ -140,6 +141,55 @@ DecimalSumStateColumns makeDecimalSumOverflowState(
 std::unique_ptr<cudf::column> adjustDecimalSumForOverflow(
     const cudf::column_view& sumCol,
     const cudf::column_view& overflowCol,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+// Native DECIMAL128 SUM state is ROW(sum DECIMAL(38, s), overflow BIGINT) and
+// AVG state is ROW(sum DECIMAL(38, s), count BIGINT, overflow BIGINT). The
+// value of a state is sum + overflow * 2^127, the CPU
+// LongDecimalWithOverflowState contract, so intermediate states may exceed
+// DECIMAL(38) or int128 and later cancel. The parent is always valid; sum is
+// null for a group without non-null input; count and overflow are never null.
+inline constexpr cudf::size_type kDecimal128StateSumChild = 0;
+inline constexpr cudf::size_type kDecimal128StateCountChild = 1;
+
+inline constexpr cudf::size_type decimal128StateOverflowChild(bool average) {
+  return average ? 2 : 1;
+}
+
+struct Decimal128StateChildren {
+  cudf::column_view sum;
+  // Set for AVG state only.
+  std::optional<cudf::column_view> count;
+  cudf::column_view overflow;
+};
+
+/**
+ * Validates a native DECIMAL128 SUM/AVG state column and returns its sliced
+ * children.
+ *
+ * @param state STRUCT state column.
+ * @param average true for the AVG layout, false for SUM.
+ * @param stream CUDA stream for device work.
+ */
+Decimal128StateChildren decimal128StateChildren(
+    const cudf::column_view& state,
+    bool average,
+    cuda::stream_ref stream);
+
+/**
+ * Builds a native DECIMAL128 SUM/AVG state column from its children.
+ *
+ * @param sum DECIMAL128 sums.
+ * @param count INT64 counts for AVG, nullptr for SUM.
+ * @param overflow INT64 overflow counts.
+ * @param stream CUDA stream for device work.
+ * @param mr memory resource for the struct.
+ */
+std::unique_ptr<cudf::column> makeDecimal128StateColumn(
+    std::unique_ptr<cudf::column> sum,
+    std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 

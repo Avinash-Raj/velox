@@ -637,6 +637,99 @@ struct ReduceDecimalAvgAggregator : ReduceAggregator {
   const bool trackOverflow_;
 };
 
+// Global form of the native-state DECIMAL128 SUM/AVG; see
+// GroupbyDecimal128Aggregator.
+struct ReduceDecimal128Aggregator : ReduceAggregator {
+  ReduceDecimal128Aggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      const TypePtr& resultType,
+      bool average)
+      : ReduceAggregator(step, inputIndex, nullptr, resultType, std::nullopt),
+        average_(average) {}
+
+  std::unique_ptr<cudf::column> doReduce(
+      cudf::table_view const& input,
+      TypePtr const& outputType,
+      vector_size_t /* inputRowCount */,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    const auto partialOutput = exec::isPartialOutput(step);
+    const auto stateMr = partialOutput ? mr : get_temp_mr();
+    cudf_velox::DecimalSumStateColumns state;
+    if (exec::isRawInput(step)) {
+      const auto values = input.column(inputIndex);
+      state = reduceDecimal128Sum(values, true, nullptr, stream, stateMr);
+      if (average_) {
+        state.count =
+            makeInt64(values.size() - values.null_count(), stream, stateMr);
+      }
+    } else {
+      const auto children = cudf_velox::decimal128StateChildren(
+          input.column(inputIndex), average_, stream);
+      state = reduceDecimal128Sum(
+          children.sum, true, &children.overflow, stream, stateMr);
+      if (average_) {
+        state.count = reduceInt64Sum(*children.count, stream, stateMr);
+      }
+    }
+    if (partialOutput) {
+      return cudf_velox::makeDecimal128StateColumn(
+          std::move(state.sum),
+          std::move(state.count),
+          std::move(state.overflow),
+          stream,
+          mr);
+    }
+    if (average_) {
+      return finalizeDecimalAverage(
+          std::move(state.sum),
+          std::move(state.count),
+          std::move(state.overflow),
+          outputType,
+          stream,
+          mr);
+    }
+    return finalizeDecimalSum(
+        std::move(state.sum),
+        std::move(state.overflow),
+        outputType,
+        stream,
+        mr);
+  }
+
+ private:
+  static std::unique_ptr<cudf::column> makeInt64(
+      int64_t value,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) {
+    return cudf::make_column_from_scalar(
+        cudf::numeric_scalar<int64_t>(value, true, stream, get_temp_mr()),
+        1,
+        stream,
+        mr);
+  }
+
+  // One-row INT64 SUM; zero for no states.
+  static std::unique_ptr<cudf::column> reduceInt64Sum(
+      cudf::column_view values,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) {
+    const auto result = cudf::reduce(
+        values,
+        *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+        cudf::data_type{cudf::type_id::INT64},
+        stream,
+        get_temp_mr());
+    if (!result->is_valid(stream)) {
+      return makeInt64(0, stream, mr);
+    }
+    return cudf::make_column_from_scalar(*result, 1, stream, mr);
+  }
+
+  const bool average_;
+};
+
 struct ApproxDistinctAggregator : ReduceAggregator {
   static constexpr cudf::null_policy kNullPolicy = cudf::null_policy::EXCLUDE;
   static constexpr cudf::nan_policy kNanPolicy = cudf::nan_policy::NAN_IS_VALID;
@@ -852,6 +945,10 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+  if (p.compactDecimalState && p.longDecimalInput) {
+    return std::make_unique<ReduceDecimal128Aggregator>(
+        p.companionStep, p.inputIndex, p.resultType, kind == prefix + "avg");
+  }
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<ReduceDecimalSumAggregator>(

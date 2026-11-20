@@ -18,29 +18,57 @@
 
 namespace facebook::velox::cudf_velox {
 
+namespace {
+
+bool isCompactAverage(const core::AggregationNode::Aggregate& aggregate) {
+  return aggregate.call->name() ==
+      CudfConfig::getInstance().functionNamePrefix + "avg";
+}
+
+} // namespace
+
 TypePtr CudfAggregationNode::compactIntermediateType(
     const Aggregate& aggregate,
     bool grouped) {
   const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
-  const bool average = grouped && aggregate.call->name() == prefix + "avg";
+  const bool average = isCompactAverage(aggregate);
   if ((!average && aggregate.call->name() != prefix + "sum") ||
       aggregate.rawInputTypes.size() != 1 ||
-      !aggregate.rawInputTypes[0]->isShortDecimal()) {
+      !aggregate.rawInputTypes[0]->isDecimal()) {
     return nullptr;
   }
+  const bool longDecimal = aggregate.rawInputTypes[0]->isLongDecimal();
+  if (average && !grouped && !longDecimal) {
+    return nullptr;
+  }
+  const auto* family = longDecimal ? "Decimal128" : "Decimal64";
   VELOX_USER_CHECK(
       !aggregate.distinct && aggregate.sortingKeys.empty() &&
           aggregate.sortingOrders.empty() && !aggregate.mask,
-      "Compact Decimal64 aggregation does not support DISTINCT, ordering or masks");
+      "Compact {} aggregation does not support DISTINCT, ordering or masks",
+      family);
   VELOX_USER_CHECK_EQ(aggregate.call->inputs().size(), 1);
   const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
       aggregate.call->inputs()[0].get());
   VELOX_USER_CHECK(
       field && field->isInputColumn(),
-      "Compact Decimal64 aggregation requires a column input");
+      "Compact {} aggregation requires a column input",
+      family);
   auto sumType =
       DECIMAL(38, getDecimalPrecisionScale(*aggregate.rawInputTypes[0]).second);
+  if (longDecimal) {
+    return average
+        ? ROW({{"sum", sumType}, {"count", BIGINT()}, {"overflow", BIGINT()}})
+        : ROW({{"sum", sumType}, {"overflow", BIGINT()}});
+  }
   return average ? ROW({{"sum", sumType}, {"count", BIGINT()}}) : sumType;
+}
+
+TypePtr CudfAggregationNode::compactResultType(const Aggregate& aggregate) {
+  const auto& rawType = aggregate.rawInputTypes.at(0);
+  return isCompactAverage(aggregate)
+      ? rawType
+      : DECIMAL(38, getDecimalPrecisionScale(*rawType).second);
 }
 
 CudfAggregationNode::CudfAggregationNode(
@@ -76,9 +104,8 @@ CudfAggregationNode::CudfAggregationNode(
     const auto& inputType =
         step() == Step::kPartial ? aggregate.rawInputTypes[0] : stateType;
     VELOX_USER_CHECK(*input->type() == *inputType);
-    const auto& resultType = step() == Step::kFinal && stateType->isRow()
-        ? aggregate.rawInputTypes[0]
-        : stateType;
+    const auto resultType =
+        step() == Step::kFinal ? compactResultType(aggregate) : stateType;
     VELOX_USER_CHECK(*aggregate.call->type() == *resultType);
     const auto& field = static_cast<const core::FieldAccessTypedExpr&>(*input);
     VELOX_USER_CHECK(

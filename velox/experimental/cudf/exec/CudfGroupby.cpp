@@ -1101,6 +1101,130 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   const bool bufferedState_;
 };
 
+// Native-state DECIMAL128 SUM/AVG (see Decimal128StateChildren). Raw values and
+// state sums are summed with SUM_OVERFLOW, and the merged states' overflow
+// with SUM, so the state carries the int128 overflow and may cancel exactly as
+// in the CPU LongDecimalWithOverflowState; only FINAL SUM can fail.
+struct GroupbyDecimal128Aggregator : GroupbyAggregator {
+  GroupbyDecimal128Aggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      const TypePtr& resultType,
+      bool average)
+      : GroupbyAggregator(step, inputIndex, nullptr, resultType, std::nullopt),
+        average_(average) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref /*mr*/) override {
+    VELOX_CHECK(!maskIndex.has_value());
+    sumIdx_ = requests.size();
+    if (exec::isRawInput(step)) {
+      auto& request = requests.emplace_back();
+      request.values = tbl.column(inputIndex);
+      request.aggregations.push_back(makeDecimalSumAggregation(true));
+      if (average_) {
+        request.aggregations.push_back(
+            cudf::make_count_aggregation<cudf::groupby_aggregation>(
+                cudf::null_policy::EXCLUDE));
+      }
+      overflowIdx_.reset();
+      return;
+    }
+    const auto state = cudf_velox::decimal128StateChildren(
+        tbl.column(inputIndex), average_, stream);
+    auto& sumRequest = requests.emplace_back();
+    sumRequest.values = state.sum;
+    sumRequest.aggregations.push_back(makeDecimalSumAggregation(true));
+    if (average_) {
+      countIdx_ = requests.size();
+      auto& countRequest = requests.emplace_back();
+      countRequest.values = *state.count;
+      countRequest.aggregations.push_back(
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    }
+    overflowIdx_ = requests.size();
+    auto& overflowRequest = requests.emplace_back();
+    overflowRequest.values = state.overflow;
+    overflowRequest.aggregations.push_back(
+        cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    auto state =
+        takeDecimalSumResult(results, sumIdx_, true, overflowIdx_, stream, mr);
+    std::unique_ptr<cudf::column> count;
+    if (average_) {
+      // Raw input counts in the sum request; state merges sum their counts.
+      count = cudf_velox::castCountColumnToInt64(
+          exec::isRawInput(step) ? std::move(results[sumIdx_].results[1])
+                                 : std::move(results[countIdx_].results[0]),
+          stream);
+    }
+    if (exec::isPartialOutput(step)) {
+      return cudf_velox::makeDecimal128StateColumn(
+          std::move(state.sum),
+          std::move(count),
+          std::move(state.overflow),
+          stream,
+          mr);
+    }
+    return finalizeState(
+        std::move(state.sum),
+        std::move(count),
+        std::move(state.overflow),
+        stream,
+        mr);
+  }
+
+  std::unique_ptr<cudf::column> finalize(
+      std::unique_ptr<cudf::column> state,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    VELOX_CHECK_EQ(step, core::AggregationNode::Step::kFinal);
+    cudf_velox::decimal128StateChildren(state->view(), average_, stream);
+    auto children = std::move(state->release().children);
+    return finalizeState(
+        std::move(children[cudf_velox::kDecimal128StateSumChild]),
+        average_ ? std::move(children[cudf_velox::kDecimal128StateCountChild])
+                 : nullptr,
+        std::move(children[cudf_velox::decimal128StateOverflowChild(average_)]),
+        stream,
+        mr);
+  }
+
+ private:
+  std::unique_ptr<cudf::column> finalizeState(
+      std::unique_ptr<cudf::column> sum,
+      std::unique_ptr<cudf::column> count,
+      std::unique_ptr<cudf::column> overflow,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const {
+    if (average_) {
+      return finalizeDecimalAverage(
+          std::move(sum),
+          std::move(count),
+          std::move(overflow),
+          resultType,
+          stream,
+          mr);
+    }
+    return finalizeDecimalSum(
+        std::move(sum), std::move(overflow), resultType, stream, mr);
+  }
+
+  const bool average_;
+  uint32_t sumIdx_{0};
+  uint32_t countIdx_{0};
+  // Set when merging states, whose overflow is summed in its own request.
+  std::optional<uint32_t> overflowIdx_;
+};
+
 struct GroupbyCountAggregator : GroupbyAggregator {
   GroupbyCountAggregator(
       core::AggregationNode::Step step,
@@ -1602,6 +1726,10 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
     bool bufferedState) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+  if (p.compactDecimalState && p.longDecimalInput) {
+    return std::make_unique<GroupbyDecimal128Aggregator>(
+        p.companionStep, p.inputIndex, p.resultType, kind == prefix + "avg");
+  }
   if (kind.rfind(prefix + "sum", 0) == 0) {
     if (p.isDecimalAggregate) {
       return std::make_unique<GroupbyDecimalSumAggregator>(

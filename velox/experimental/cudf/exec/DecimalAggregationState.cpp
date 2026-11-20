@@ -30,9 +30,12 @@
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/strings/utilities.hpp>
+#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <limits>
+#include <string_view>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -384,6 +387,80 @@ std::unique_ptr<cudf::column> adjustDecimalSumForOverflow(
         sumCol.null_count());
   }
   return out;
+}
+
+namespace {
+
+void checkInt64(const cudf::column_view& column, std::string_view name) {
+  VELOX_CHECK(
+      column.type().id() == cudf::type_id::INT64,
+      "Decimal128 aggregation state requires an INT64 {} child (type is {})",
+      name,
+      cudf::type_to_name(column.type()));
+}
+
+} // namespace
+
+Decimal128StateChildren decimal128StateChildren(
+    const cudf::column_view& state,
+    bool average,
+    cuda::stream_ref stream) {
+  auto const numChildren = decimal128StateOverflowChild(average) + 1;
+  VELOX_CHECK(
+      state.type().id() == cudf::type_id::STRUCT &&
+          state.num_children() == numChildren,
+      "Decimal128 {} state requires a STRUCT with {} children (type is {})",
+      average ? "AVG" : "SUM",
+      numChildren,
+      cudf::type_to_name(state.type()));
+  VELOX_CHECK(
+      !state.has_nulls(), "Decimal128 aggregation state rows must be valid");
+  const cudf::structs_column_view structs(state);
+  Decimal128StateChildren children{
+      .sum = structs.get_sliced_child(kDecimal128StateSumChild, stream),
+      .count = average ? std::make_optional(structs.get_sliced_child(
+                             kDecimal128StateCountChild, stream))
+                       : std::nullopt,
+      .overflow = structs.get_sliced_child(
+          decimal128StateOverflowChild(average), stream)};
+  VELOX_CHECK(
+      children.sum.type().id() == cudf::type_id::DECIMAL128,
+      "Decimal128 aggregation state requires a DECIMAL128 sum child (type is {})",
+      cudf::type_to_name(children.sum.type()));
+  checkInt64(children.overflow, "overflow");
+  if (children.count) {
+    checkInt64(*children.count, "count");
+  }
+  return children;
+}
+
+std::unique_ptr<cudf::column> makeDecimal128StateColumn(
+    std::unique_ptr<cudf::column> sum,
+    std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(sum->type().id() == cudf::type_id::DECIMAL128);
+  auto const size = sum->size();
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(std::move(sum));
+  if (count) {
+    checkInt64(count->view(), "count");
+    children.push_back(std::move(count));
+  }
+  checkInt64(overflow->view(), "overflow");
+  children.push_back(std::move(overflow));
+  return cudf::make_structs_column(
+      size,
+      std::move(children),
+      0,
+      cudf::create_null_mask(
+          0,
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          cudf::memory_resources{mr, get_temp_mr()}),
+      stream,
+      mr);
 }
 
 } // namespace facebook::velox::cudf_velox
