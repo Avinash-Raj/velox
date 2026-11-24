@@ -156,6 +156,22 @@ void assembleDecimalSumOverflow(
     cuda::stream_ref stream);
 
 /**
+ * Writes the exact value wraps * 2^64 + sum of a DECIMAL64 SUM_OVERFLOW(COUNT)
+ * result as a DECIMAL128 sum. A sum of 64-bit values fits int128, so no
+ * overflow remains. Null rows of sum write zero.
+ *
+ * @param sum DECIMAL64 sums modulo 2^64.
+ * @param wraps INT64 net number of 2^64 wraps per row.
+ * @param out DECIMAL128 output, sized to sum.
+ * @param stream CUDA stream for the launch.
+ */
+void widenDecimal64SumOverflow(
+    cudf::column_view sum,
+    cudf::column_view wraps,
+    cudf::mutable_column_view out,
+    cuda::stream_ref stream);
+
+/**
  * Applies DecimalUtil::adjustSumForOverflow and the DECIMAL(38) range check of
  * the CPU DecimalSumAggregate to each non-null row and writes the adjusted
  * value. Null rows write zero.

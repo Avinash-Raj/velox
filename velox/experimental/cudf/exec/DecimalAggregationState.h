@@ -128,6 +128,22 @@ DecimalSumStateColumns makeDecimalSumOverflowState(
     rmm::device_async_resource_ref mr);
 
 /**
+ * Converts the result of cuDF SUM_OVERFLOW with sum_overflow_output::COUNT
+ * over DECIMAL64 input, STRUCT{sum DECIMAL64, overflow INT64} with exact value
+ * overflow * 2^64 + sum, into a DECIMAL128 sum at the same scale. A null
+ * result row, which is a group without non-null input, gives a null sum.
+ *
+ * @param sumOverflow SUM_OVERFLOW(COUNT) result column.
+ * @param stream CUDA stream for device work.
+ * @param mr memory resource for the output.
+ * @return DECIMAL128 sums.
+ */
+std::unique_ptr<cudf::column> widenDecimal64SumOverflow(
+    std::unique_ptr<cudf::column> sumOverflow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/**
  * Finalizes DECIMAL128 SUM state like the CPU DecimalSumAggregate: throws the
  * same VeloxUserError when a row's sum + overflow * 2^127 does not fit
  * DECIMAL(38).

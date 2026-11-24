@@ -52,7 +52,6 @@
 namespace {
 
 using namespace facebook::velox;
-using cudf_velox::castDecimal64InputToDecimal128;
 using cudf_velox::CountInputKind;
 using cudf_velox::finalizeDecimalAverage;
 using cudf_velox::finalizeDecimalSum;
@@ -371,7 +370,7 @@ using GroupbyMaxAggregator = SimpleGroupbyAggregator<
 
 // Long decimal sums use SUM_OVERFLOW, which reports the int128 wraps that a
 // plain SUM drops, so the state can carry them like the CPU aggregate does.
-// Sums of DECIMAL64 input cannot wrap and keep the plain SUM.
+// Raw DECIMAL64 input also uses it, to sum at 64 bits and widen once.
 std::unique_ptr<cudf::groupby_aggregation> makeDecimalSumAggregation(
     bool trackOverflow) {
   if (trackOverflow) {
@@ -522,26 +521,43 @@ void addDecimalFinalSumOnlyRequest(
       decodedOverflow);
 }
 
-void addDecimalRawPartialSingleSumRequest(
+// Adds the SUM (and optional COUNT) request over raw input. DECIMAL64 input is
+// summed at 64 bits with SUM_OVERFLOW(COUNT) instead of being cast to
+// DECIMAL128 first; returns true when the sum result must then be widened
+// with takeRawDecimalSum.
+bool addDecimalRawPartialSingleSumRequest(
     cudf::column_view input,
     std::vector<cudf::groupby::aggregation_request>& requests,
     bool includeCountAggregation,
     bool trackOverflow,
-    cuda::stream_ref stream,
-    uint32_t& sumIdx,
-    std::unique_ptr<cudf::column>& castedInput) {
-  // TODO: Avoid materializing DECIMAL128 input for partial Decimal64 SUM by
-  // widening values on the fly while accumulating, as global reduction does.
-  auto inputView = castDecimal64InputToDecimal128(input, castedInput, stream);
+    uint32_t& sumIdx) {
+  const bool narrow = input.type().id() == cudf::type_id::DECIMAL64;
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
-  request.values = inputView;
-  request.aggregations.push_back(makeDecimalSumAggregation(trackOverflow));
+  request.values = input;
+  request.aggregations.push_back(
+      makeDecimalSumAggregation(trackOverflow || narrow));
   if (includeCountAggregation) {
     request.aggregations.push_back(
         cudf::make_count_aggregation<cudf::groupby_aggregation>(
             cudf::null_policy::EXCLUDE));
   }
+  return narrow;
+}
+
+// Widens the 64-bit sum of a raw DECIMAL64 request in place, so the result
+// matches a DECIMAL128 sum of the input.
+void takeRawDecimalSum(
+    std::vector<cudf::groupby::aggregation_result>& results,
+    uint32_t sumIdx,
+    bool narrow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (!narrow) {
+    return;
+  }
+  auto& sum = results[sumIdx].results[0];
+  sum = cudf_velox::widenDecimal64SumOverflow(std::move(sum), stream, mr);
 }
 
 // Incremental groupby keeps long decimal SUM and AVG state between batches as
@@ -707,8 +723,8 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
         VELOX_CHECK(
             input.type() == cudf_velox::veloxToCudfDataType(resultType));
       }
-      addDecimalRawPartialSingleSumRequest(
-          input, requests, false, false, stream, sumIdx_, castedInput_);
+      narrowSum_ = addDecimalRawPartialSingleSumRequest(
+          input, requests, false, false, sumIdx_);
     } else if (
         !exec::isRawInput(step) &&
         isBufferedDecimalState(tbl.column(inputIndex))) {
@@ -752,14 +768,12 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       // null-excluding sum (and the partial count) honor the mask.
       // materializeMaskedInput returns the plain column when this aggregate has
       // no mask.
-      addDecimalRawPartialSingleSumRequest(
+      narrowSum_ = addDecimalRawPartialSingleSumRequest(
           materializeMaskedInput(tbl, inputIndex, stream, mr),
           requests,
           step == core::AggregationNode::Step::kPartial,
           trackOverflow_,
-          stream,
-          sumIdx_,
-          castedInput_);
+          sumIdx_);
     }
   }
 
@@ -767,6 +781,7 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
+    takeRawDecimalSum(results, sumIdx_, narrowSum_, stream, mr);
     if (compactDecimalState_) {
       return std::move(results[sumIdx_].results[0]);
     }
@@ -802,7 +817,6 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
 
   void releaseInput() override {
     GroupbyAggregator::releaseInput();
-    castedInput_.reset();
     decodedSum_.reset();
     decodedCount_.reset();
     decodedOverflow_.reset();
@@ -867,9 +881,8 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
   std::unique_ptr<cudf::column> decodedOverflow_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
-  std::unique_ptr<cudf::column> castedInput_;
+  // Set when the sum request summed raw DECIMAL64 input at 64 bits.
+  bool narrowSum_{false};
   const bool compactDecimalState_;
   // Long decimal SUM state tracks int128 overflow as the CPU aggregate does.
   const bool trackOverflow_;
@@ -940,15 +953,13 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
           decodedCount_,
           decodedOverflow_);
     } else {
-      addDecimalRawPartialSingleSumRequest(
+      narrowSum_ = addDecimalRawPartialSingleSumRequest(
           tbl.column(inputIndex),
           requests,
           step == core::AggregationNode::Step::kPartial ||
               step == core::AggregationNode::Step::kSingle,
           trackOverflow_,
-          stream,
-          sumIdx_,
-          castedInput_);
+          sumIdx_);
     }
   }
 
@@ -956,6 +967,7 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
+    takeRawDecimalSum(results, sumIdx_, narrowSum_, stream, mr);
     if (compactDecimalState_) {
       auto col = std::move(results[sumIdx_].results[0]);
       auto count = exec::isRawInput(step)
@@ -1017,7 +1029,6 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
 
   void releaseInput() override {
     GroupbyAggregator::releaseInput();
-    castedInput_.reset();
     decodedSum_.reset();
     decodedCount_.reset();
     decodedOverflow_.reset();
@@ -1091,9 +1102,8 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
   std::unique_ptr<cudf::column> decodedOverflow_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
-  std::unique_ptr<cudf::column> castedInput_;
+  // Set when the sum request summed raw DECIMAL64 input at 64 bits.
+  bool narrowSum_{false};
   const bool compactDecimalState_;
   // Long decimal AVG state tracks int128 overflow as the CPU aggregate does.
   const bool trackOverflow_;

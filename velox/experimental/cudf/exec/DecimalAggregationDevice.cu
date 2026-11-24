@@ -305,6 +305,28 @@ struct AssembleSumOverflowFunctor {
   }
 };
 
+struct WidenDecimal64SumOverflowFunctor {
+  // Validity of sums; nullptr when every row is valid.
+  const cudf::bitmask_type* sumMask;
+  cudf::size_type sumOffset;
+  const int64_t* sums;
+  const int64_t* wraps;
+  __int128_t* out;
+
+  __device__ void operator()(cudf::size_type idx) const {
+    if (sumMask != nullptr && !cudf::bit_is_set(sumMask, sumOffset + idx)) {
+      out[idx] = 0;
+      return;
+    }
+    // Unsigned arithmetic so that rows null only in the SUM_OVERFLOW parent,
+    // whose children are unspecified, cannot overflow; valid rows are exact.
+    const auto wide =
+        (static_cast<__uint128_t>(static_cast<__int128_t>(wraps[idx])) << 64) +
+        static_cast<__uint128_t>(static_cast<__int128_t>(sums[idx]));
+    out[idx] = static_cast<__int128_t>(wide);
+  }
+};
+
 struct AdjustSumForOverflowFunctor {
   const cudf::bitmask_type* sumMask;
   cudf::size_type sumOffset;
@@ -664,6 +686,33 @@ void assembleDecimalSumOverflow(
             .stateOverflowOffset =
                 stateOverflowSum == nullptr ? 0 : stateOverflowSum->offset(),
             .overflows = overflow.data<int64_t>()};
+      },
+      stream);
+}
+
+void widenDecimal64SumOverflow(
+    cudf::column_view sum,
+    cudf::column_view wraps,
+    cudf::mutable_column_view out,
+    cuda::stream_ref stream) {
+  CUDF_EXPECTS(
+      sum.type().id() == cudf::type_id::DECIMAL64 &&
+          wraps.type().id() == cudf::type_id::INT64 &&
+          out.type().id() == cudf::type_id::DECIMAL128,
+      "Widening a Decimal64 sum requires DECIMAL64 sums, INT64 wraps and a "
+      "DECIMAL128 output");
+  CUDF_EXPECTS(
+      wraps.size() == sum.size() && out.size() == sum.size(),
+      "Decimal64 sum overflow columns must have the same size");
+  launchDeviceFor(
+      sum.size(),
+      [&] {
+        return WidenDecimal64SumOverflowFunctor{
+            .sumMask = sum.nullable() ? sum.null_mask() : nullptr,
+            .sumOffset = sum.offset(),
+            .sums = sum.data<int64_t>(),
+            .wraps = wraps.data<int64_t>(),
+            .out = out.data<__int128_t>()};
       },
       stream);
 }

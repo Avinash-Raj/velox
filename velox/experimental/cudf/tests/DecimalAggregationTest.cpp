@@ -2239,6 +2239,113 @@ TEST_F(CudfDecimalTest, compactAvgGroupedEmpty) {
        makeFlatVector<int64_t>({}, DECIMAL(12, 2))}));
 }
 
+// Raw grouped Decimal64 SUM and AVG sum at 64 bits and widen once per group.
+// Groups wrap 64 bits once, wrap negative, wrap up and back down to cancel,
+// hold only nulls, or mix nulls and small values.
+TEST_F(CudfDecimalTest, decimal64GroupedSumWrapsMatchCpu) {
+  constexpr int64_t kBig = 999'999'999'999'999'999;
+  std::vector<int32_t> keys;
+  std::vector<std::optional<int64_t>> values;
+  std::vector<bool> mask;
+  auto add = [&](int32_t key, std::optional<int64_t> value, int count) {
+    for (int i = 0; i < count; ++i) {
+      keys.push_back(key);
+      values.push_back(value);
+      mask.push_back(keys.size() % 3 != 0);
+    }
+  };
+  add(0, kBig, 10);
+  add(1, -kBig, 25);
+  add(2, kBig, 20);
+  add(2, -kBig, 20);
+  add(2, 7, 1);
+  add(3, std::nullopt, 4);
+  add(4, std::nullopt, 2);
+  add(4, -12345, 5);
+  add(5, kBig, 40);
+  add(5, -kBig, 1);
+  auto input = makeRowVector(
+      {"k", "d", "m"},
+      {makeFlatVector<int32_t>(keys),
+       makeNullableFlatVector<int64_t>(values, DECIMAL(18, 2)),
+       makeFlatVector<bool>(mask)});
+  const std::vector<RowVectorPtr> batches = {input, input};
+  const std::vector<std::string> aggregates = {"sum(d) AS s", "avg(d) AS a"};
+
+  // Native state. Unlike Decimal128 state, the final step may stream.
+  for (bool intermediate : {false, true}) {
+    for (std::optional<int32_t> batchRows :
+         {std::optional<int32_t>{}, std::optional<int32_t>{7}}) {
+      for (bool streaming : {false, true}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "intermediate={} batchRows={} streaming={}",
+                intermediate,
+                batchRows.value_or(0),
+                streaming));
+        auto builder = exec::test::PlanBuilder();
+        builder.values(batches)
+            .partialAggregation({"k"}, aggregates)
+            .localPartition({"k"});
+        if (intermediate) {
+          builder.intermediateAggregation();
+        }
+        auto original = builder.finalAggregation().planNode();
+        const auto rewritten = CudfPlanRewriter::rewrite(original);
+        auto* final = dynamic_cast<const CudfAggregationNode*>(rewritten.get());
+        ASSERT_NE(final, nullptr);
+        EXPECT_EQ(*final->intermediateType(0), *DECIMAL(38, 2));
+        EXPECT_EQ(
+            *final->intermediateType(1),
+            *ROW({{"sum", DECIMAL(38, 2)}, {"count", BIGINT()}}));
+        EXPECT_EQ(
+            assertCompactMatchesCpu(
+                original,
+                {.gpuBatchRows = batchRows,
+                 .streaming = streaming,
+                 .maxDrivers = 2})
+                .first,
+            "");
+      }
+    }
+  }
+
+  // VARBINARY state and single aggregation. Masked avg runs on the CPU, so
+  // only sum is masked.
+  for (bool masked : {false, true}) {
+    const auto aggs =
+        masked ? std::vector<std::string>{"sum(d) AS s"} : aggregates;
+    const auto masks =
+        masked ? std::vector<std::string>{"m"} : std::vector<std::string>{};
+    std::vector<core::PlanNodePtr> plans;
+    plans.push_back(
+        exec::test::PlanBuilder()
+            .values(batches)
+            .singleAggregation({"k"}, aggs, masks)
+            .planNode());
+    plans.push_back(
+        exec::test::PlanBuilder()
+            .values(batches)
+            .partialAggregation({"k"}, aggs, masks)
+            .finalAggregation()
+            .planNode());
+    plans.push_back(
+        exec::test::PlanBuilder()
+            .values(batches)
+            .partialAggregation({"k"}, aggs, masks)
+            .intermediateAggregation()
+            .finalAggregation()
+            .planNode());
+    for (size_t i = 0; i < plans.size(); ++i) {
+      SCOPED_TRACE(fmt::format("masked={} plan={}", masked, i));
+      exec::test::AssertQueryBuilder(plans[i])
+          .maxDrivers(1)
+          .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+          .assertResults(cpuResults(plans[i], 1));
+    }
+  }
+}
+
 TEST_F(CudfDecimalTest, compactAvgThroughRenamedProject) {
   auto input = makeRowVector(
       {"k", "d"},

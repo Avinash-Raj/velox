@@ -354,6 +354,40 @@ DecimalSumStateColumns makeDecimalSumOverflowState(
   return state;
 }
 
+std::unique_ptr<cudf::column> widenDecimal64SumOverflow(
+    std::unique_ptr<cudf::column> sumOverflow,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(
+      sumOverflow->type().id() == cudf::type_id::STRUCT &&
+          sumOverflow->num_children() == 2,
+      "Decimal64 SUM_OVERFLOW result must be a STRUCT of sum and overflow (type is {})",
+      cudf::type_to_name(sumOverflow->type()));
+  const auto view = sumOverflow->view();
+  const auto sum = view.child(0);
+  VELOX_CHECK(
+      sum.type().id() == cudf::type_id::DECIMAL64,
+      "Decimal64 SUM_OVERFLOW requires a DECIMAL64 sum (type is {})",
+      cudf::type_to_name(sum.type()));
+  // SUM_OVERFLOW marks a group without non-null input null in the parent only.
+  auto [mask, nullCount] = cudf::bitmask_and(
+      cudf::table_view{{view, sum}},
+      stream,
+      cudf::memory_resources{mr, get_temp_mr()});
+  auto out = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::DECIMAL128, sum.type().scale()},
+      view.size(),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  detail::widenDecimal64SumOverflow(
+      sum, view.child(1), out->mutable_view(), stream);
+  if (nullCount > 0) {
+    out->set_null_mask(std::move(mask), nullCount);
+  }
+  return out;
+}
+
 std::unique_ptr<cudf::column> adjustDecimalSumForOverflow(
     const cudf::column_view& sumCol,
     const cudf::column_view& overflowCol,
